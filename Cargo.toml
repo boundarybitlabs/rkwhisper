@@ -1,0 +1,7 @@
+[package]
+name = "rkwhisper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rknpu2 = { version = "0.0.7", features = ["libloading", "rk3576"] }
