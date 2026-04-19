@@ -4,4 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = { version = "1.0.99", features = ["backtrace"] }
+clap = { version = "4.5.45", features = ["derive"] }
+hound = "3.5.1"
+ndarray = "0.16.1"
+ndarray-npy = "0.9.1"
+num-complex = "0.4.6"
 rknpu2 = { version = "0.0.7", features = ["libloading", "rk3576"] }
+tokenizers = "0.21.4"
+
+[dev-dependencies]
+ndarray = "0.16.1"
+ndarray-npy = "0.9.1"
+ordered-float = "5.1.0"
