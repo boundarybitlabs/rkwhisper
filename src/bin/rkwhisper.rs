@@ -5,7 +5,7 @@ use rkwhisper::{
     MelSpectrogram,
     decoder::WhisperDecoder,
     encoder::{EncKvModel, WhisperEncoder},
-    spec::WhisperSmall,
+    spec::WhisperMedium,
     whisper::transcribe,
 };
 use std::path::PathBuf;
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
 
     let lib = find_rknn_library().next().unwrap();
 
-    let encoder = WhisperEncoder::<WhisperSmall>::new(RKNN::new_with_library(
+    let encoder = WhisperEncoder::<WhisperMedium>::new(RKNN::new_with_library(
         &lib,
         &mut std::fs::read(&args.encoder)?,
         0,
@@ -71,14 +71,14 @@ fn main() -> Result<()> {
         0,
     )?);
 
-    let enc_kv = EncKvModel::<WhisperSmall>::new(RKNN::new_with_library(
+    let enc_kv = EncKvModel::<WhisperMedium>::new(RKNN::new_with_library(
         &lib,
         &mut std::fs::read(&args.enc_kv)?,
         0,
     )?);
 
     let dec_rknn = RKNN::new_with_library(&lib, &mut std::fs::read(&args.decoder)?, 0)?;
-    let mut decoder = WhisperDecoder::<WhisperSmall>::new(&dec_rknn);
+    let mut decoder = WhisperDecoder::<WhisperMedium>::new(&dec_rknn);
 
     let text = transcribe(
         &args.wav.to_string_lossy(),

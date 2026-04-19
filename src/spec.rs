@@ -36,7 +36,26 @@ impl WhisperSpec for WhisperLargeV3Turbo {
     const TOKEN_EOT: u32 = 50257;
 }
 
+pub struct WhisperMedium;
+
+impl WhisperSpec for WhisperMedium {
+    const MEL_BINS: usize = 80;
+    const FRAMES: usize = 3000;
+
+    const ENC_SEQ: usize = 1500;
+    const HIDDEN: usize = 1024;
+
+    const N_LAYERS: usize = 24;
+    const N_HEADS: usize = 16;
+    const D_HEAD: usize = 64;
+    const T_CACHE: usize = 448;
+
+    const VOCAB: usize = 51865;
+    const TOKEN_EOT: u32 = 50257;
+}
+
 pub struct WhisperSmall;
+
 
 impl WhisperSpec for WhisperSmall {
     const MEL_BINS: usize = 80;

@@ -11,7 +11,7 @@ ndarray = "0.16.1"
 ndarray-npy = "0.9.1"
 num-complex = "0.4.6"
 rknpu2 = { version = "0.0.7", features = ["libloading", "rk3576"] }
-tokenizers = "0.21.4"
+tokenizers = { version = "0.21.4", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
 ndarray = "0.16.1"
