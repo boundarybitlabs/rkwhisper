@@ -44,59 +44,59 @@ pub fn transcribe<S: WhisperSpec>(
         let prompt = control_prompt(&tokenizer, lang, task, notimestamps)?;
 
         state.reset();
+        let mut last_logits = vec![0f32; S::VOCAB];
         for (i, &id) in prompt.iter().enumerate() {
-            let _ = decoder
+            last_logits = decoder
                 .step(&mut state, id)
                 .map_err(|e| anyhow!("prime step {i} failed on chunk {chunk_idx}: {e}"))?;
         }
+
+        let tok_eot = S::TOKEN_EOT;
+        let tok_sot = tokenizer.token_to_id("<|startoftranscript|>").unwrap();
+        let tok_notimestamps = tokenizer.token_to_id("<|notimestamps|>").unwrap();
+        let prompt_len = prompt.len();
+
+        let suppress_fn = |gen_len: usize, logits: &mut [f32]| {
+            // Suppress EOT on the first generated token
+            // In beam search, gen_len includes the prompt
+            if gen_len <= prompt_len {
+                logits[tok_eot as usize] = -1e4;
+            }
+
+            // Suppress SOT and control tokens (SOT..=NoTimestamps)
+            for i in (tok_sot as usize)..=(tok_notimestamps as usize) {
+                if i < logits.len() {
+                    logits[i] = -1e4;
+                }
+            }
+
+            // Suppress timestamps (everything after NoTimestamps)
+            for i in (tok_notimestamps as usize + 1)..logits.len() {
+                logits[i] = -1e4;
+            }
+        };
 
         let mut generated: Vec<u32>;
 
         if beam_size > 1 {
             let mut beam_search =
-                BeamSearch::<S>::new(beam_size, state.clone(), prompt.clone(), 0.6);
+                BeamSearch::<S>::new(beam_size, state.clone(), last_logits, prompt.clone(), 0.6);
             for _ in 0..max_new_tokens {
-                beam_search.step(decoder)?;
+                beam_search.step(decoder, &suppress_fn)?;
                 if beam_search.beams.is_empty() {
                     break;
                 }
             }
             generated = beam_search.best_result().unwrap_or_default();
         } else {
-            let mut last_logits = vec![0f32; S::VOCAB];
-            // We need to get the logits from the last prompt token
-            // Wait, the prime loop above doesn't store the last logits.
-            // Let's refetch them or adjust the loop.
-            state.reset();
-            for &id in &prompt {
-                last_logits = decoder.step(&mut state, id)?;
-            }
-
-            let tok_eot = S::TOKEN_EOT;
-            let tok_sot = tokenizer.token_to_id("<|startoftranscript|>").unwrap();
-            let tok_notimestamps = tokenizer.token_to_id("<|notimestamps|>").unwrap();
-
             generated = Vec::new();
+            let mut current_logits = last_logits;
 
             for _step in 0..max_new_tokens {
-                let mut logits_1d = last_logits.clone();
-
-                if generated.is_empty() {
-                    logits_1d[tok_eot as usize] = -1e4;
-                }
-
-                for i in (tok_sot as usize)..=(tok_notimestamps as usize) {
-                    if i < logits_1d.len() {
-                        logits_1d[i] = -1e4;
-                    }
-                }
-
-                for i in (tok_notimestamps as usize + 1)..logits_1d.len() {
-                    logits_1d[i] = -1e4;
-                }
+                let mut logits_1d = current_logits.clone();
+                suppress_fn(prompt_len + generated.len(), &mut logits_1d);
 
                 let token_id = argmax_token(&logits_1d);
-
                 if token_id == tok_eot {
                     break;
                 }
@@ -110,7 +110,7 @@ pub fn transcribe<S: WhisperSpec>(
                     }
                 }
 
-                last_logits = decoder
+                current_logits = decoder
                     .step(&mut state, token_id)
                     .map_err(|e| anyhow!("decoder step failed on chunk {chunk_idx}: {e}"))?;
             }
