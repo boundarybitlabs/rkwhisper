@@ -1,4 +1,3 @@
-#![feature(generic_const_exprs)]
 use anyhow::{Context, bail};
 use rknpu2::{
     RKNN,

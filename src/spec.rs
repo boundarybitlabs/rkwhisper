@@ -56,7 +56,6 @@ impl WhisperSpec for WhisperMedium {
 
 pub struct WhisperSmall;
 
-
 impl WhisperSpec for WhisperSmall {
     const MEL_BINS: usize = 80;
     const FRAMES: usize = 3000;
