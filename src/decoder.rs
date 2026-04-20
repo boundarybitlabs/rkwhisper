@@ -26,6 +26,46 @@ use rknpu2::{RKNN, f16};
 ///     0           logits          [1, 1, VOCAB]       Float16 UNDEFINED
 ///     1 ..= L     present_k_l*    [1, H, 1, D]        Float16 NCHW
 ///     L+1..2L     present_v_l*    [1, H, 1, D]        Float16 NCHW
+/// Per-step decoder state (KV cache and position).
+/// Can be cloned to support beam search.
+#[derive(Clone)]
+pub struct WhisperDecoderState {
+    /// Per-layer self-attention KV cache in NHWC [1, T_CACHE, D_HEAD, N_HEADS].
+    /// Flat len per layer = T * D * H.
+    pub past_k: Vec<Vec<f16>>,
+    pub past_v: Vec<Vec<f16>>,
+
+    /// Absolute step counter — number of tokens fed to the decoder since
+    /// the last `reset()`.
+    pub pos: usize,
+}
+
+impl WhisperDecoderState {
+    pub fn new<S: WhisperSpec>() -> Self {
+        let zero = f16::from_f32(0.0);
+        let l = S::N_LAYERS;
+        let t = S::T_CACHE;
+        let d = S::D_HEAD;
+        let h = S::N_HEADS;
+        Self {
+            past_k: vec![vec![zero; t * d * h]; l],
+            past_v: vec![vec![zero; t * d * h]; l],
+            pos: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        let zero = f16::from_f32(0.0);
+        for k in &mut self.past_k {
+            k.fill(zero);
+        }
+        for v in &mut self.past_v {
+            v.fill(zero);
+        }
+        self.pos = 0;
+    }
+}
+
 pub struct WhisperDecoder<'a, S: WhisperSpec> {
     rknn_dec: &'a RKNN<RuntimeAPI>,
 
@@ -34,11 +74,6 @@ pub struct WhisperDecoder<'a, S: WhisperSpec> {
     /// flat len = D * H * ENC_SEQ.
     enc_k: Vec<Vec<f16>>,
     enc_v: Vec<Vec<f16>>,
-
-    /// Per-layer self-attention KV cache in NHWC [1, T_CACHE, D_HEAD, N_HEADS].
-    /// Flat len per layer = T * D * H.
-    past_k: Vec<Vec<f16>>,
-    past_v: Vec<Vec<f16>>,
 
     /// Attention control masks. All are contiguous [1, ..., 1].
     self_attn_mask: Vec<f16>,
@@ -51,10 +86,6 @@ pub struct WhisperDecoder<'a, S: WhisperSpec> {
 
     /// Logits output buffer, flat len = VOCAB.
     logits_f16: Vec<f16>,
-
-    /// Absolute step counter — number of tokens fed to the decoder since
-    /// the last `reset()`.
-    pos: usize,
 
     phantom: core::marker::PhantomData<S>,
 }
@@ -71,15 +102,12 @@ impl<'a, S: WhisperSpec> WhisperDecoder<'a, S> {
             rknn_dec,
             enc_k: vec![vec![zero; d * h * s]; l],
             enc_v: vec![vec![zero; d * h * s]; l],
-            past_k: vec![vec![zero; t * d * h]; l],
-            past_v: vec![vec![zero; t * d * h]; l],
             self_attn_mask: vec![zero; t],
             kv_insert_mask: vec![zero; t],
             kv_retain_mask: vec![zero; t],
             token_i64: [0],
             pos_i64: [0],
             logits_f16: vec![zero; S::VOCAB],
-            pos: 0,
             phantom: core::marker::PhantomData,
         }
     }
@@ -101,20 +129,12 @@ impl<'a, S: WhisperSpec> WhisperDecoder<'a, S> {
         }
     }
 
-    /// Clear the self-attention KV cache and reset the step counter.
-    pub fn reset(&mut self) {
-        let zero = f16::from_f32(0.0);
-        for k in &mut self.past_k {
-            k.fill(zero);
-        }
-        for v in &mut self.past_v {
-            v.fill(zero);
-        }
-        self.pos = 0;
-    }
-
     /// Run one decoder step and return logits as f32.
-    pub fn step(&mut self, token_id: u32) -> Result<Vec<f32>, rknpu2::Error> {
+    pub fn step(
+        &mut self,
+        state: &mut WhisperDecoderState,
+        token_id: u32,
+    ) -> Result<Vec<f32>, rknpu2::Error> {
         debug_assert!(
             !self.enc_k[0].iter().all(|x| x.to_f32() == 0.0),
             "set_enc_kv() must be called before step()"
@@ -124,7 +144,7 @@ impl<'a, S: WhisperSpec> WhisperDecoder<'a, S> {
         let t = S::T_CACHE;
         let d = S::D_HEAD;
         let h = S::N_HEADS;
-        let pos = self.pos;
+        let pos = state.pos;
         let write_slot = pos % t;
 
         let zero = f16::from_f32(0.0);
@@ -158,7 +178,7 @@ impl<'a, S: WhisperSpec> WhisperDecoder<'a, S> {
         for layer in 0..l {
             inputs.push(Input {
                 index: (1 + layer) as u32,
-                buffer: BufView::F16(&self.past_k[layer]),
+                buffer: BufView::F16(&state.past_k[layer]),
                 pass_through: false,
                 fmt: TensorFormatKind::NHWC(TensorFormat::NHWC),
             });
@@ -166,7 +186,7 @@ impl<'a, S: WhisperSpec> WhisperDecoder<'a, S> {
         for layer in 0..l {
             inputs.push(Input {
                 index: (l + 1 + layer) as u32,
-                buffer: BufView::F16(&self.past_v[layer]),
+                buffer: BufView::F16(&state.past_v[layer]),
                 pass_through: false,
                 fmt: TensorFormatKind::NHWC(TensorFormat::NHWC),
             });
@@ -256,31 +276,35 @@ impl<'a, S: WhisperSpec> WhisperDecoder<'a, S> {
         for layer in 0..l {
             write_present_nchw_to_nhwc_slot(
                 &present_k[layer],
-                &mut self.past_k[layer],
+                &mut state.past_k[layer],
                 write_slot,
                 d,
                 h,
             );
             write_present_nchw_to_nhwc_slot(
                 &present_v[layer],
-                &mut self.past_v[layer],
+                &mut state.past_v[layer],
                 write_slot,
                 d,
                 h,
             );
         }
 
-        self.pos += 1;
+        state.pos += 1;
 
         let logits: Vec<f32> = self.logits_f16.iter().map(|x| x.to_f32()).collect();
         Ok(logits)
     }
 
     /// Prime the KV cache by stepping through every token in `prompt`.
-    pub fn prime(&mut self, prompt: &[u32]) -> Result<Vec<f32>, rknpu2::Error> {
+    pub fn prime(
+        &mut self,
+        state: &mut WhisperDecoderState,
+        prompt: &[u32],
+    ) -> Result<Vec<f32>, rknpu2::Error> {
         let mut logits = vec![0f32; S::VOCAB];
         for &id in prompt {
-            logits = self.step(id)?;
+            logits = self.step(state, id)?;
         }
         Ok(logits)
     }

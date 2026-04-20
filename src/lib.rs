@@ -10,6 +10,7 @@ use rknpu2::{
     tensor::{TensorFormat, TensorFormatKind},
 };
 
+pub mod beam;
 pub mod cache;
 pub mod decoder;
 pub mod encoder;

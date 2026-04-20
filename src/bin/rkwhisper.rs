@@ -49,6 +49,10 @@ struct Args {
     #[arg(long, default_value_t = 128)]
     max_new_tokens: usize,
 
+    /// Beam size for token selection (1 = greedy)
+    #[arg(long, default_value_t = 5)]
+    beam_size: usize,
+
     /// Suppress timestamp tokens
     #[arg(long, default_value_t = false)]
     notimestamps: bool,
@@ -91,6 +95,7 @@ fn main() -> Result<()> {
         &args.task,
         args.notimestamps,
         args.max_new_tokens,
+        args.beam_size,
     )?;
 
     println!("{text}");
