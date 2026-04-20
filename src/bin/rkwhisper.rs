@@ -1,18 +1,29 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rknpu2::{RKNN, utils::find_rknn_library};
 use rkwhisper::{
     MelSpectrogram,
     decoder::WhisperDecoder,
     encoder::{EncKvModel, WhisperEncoder},
-    spec::WhisperMedium,
+    spec::{WhisperLargeV3Turbo, WhisperMedium, WhisperSmall, WhisperSpec},
     whisper::transcribe,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[derive(ValueEnum, Clone, Debug)]
+enum Model {
+    Small,
+    Medium,
+    LargeV3Turbo,
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
+    /// Model size to use
+    #[arg(long, value_enum, default_value_t = Model::Medium)]
+    model: Model,
+
     /// Path to tokenizer.json
     #[arg(long)]
     tokenizer: PathBuf,
@@ -61,28 +72,38 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let lib = find_rknn_library().next().unwrap();
+    let lib = find_rknn_library()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Could not find rknn library"))?;
 
-    let encoder = WhisperEncoder::<WhisperMedium>::new(RKNN::new_with_library(
-        &lib,
+    match args.model {
+        Model::Small => run::<WhisperSmall>(args, &lib),
+        Model::Medium => run::<WhisperMedium>(args, &lib),
+        Model::LargeV3Turbo => run::<WhisperLargeV3Turbo>(args, &lib),
+    }
+}
+
+fn run<S: WhisperSpec>(args: Args, lib: &Path) -> Result<()> {
+    let encoder = WhisperEncoder::<S>::new(RKNN::new_with_library(
+        lib,
         &mut std::fs::read(&args.encoder)?,
         0,
     )?);
 
     let mel_spec = MelSpectrogram::new(RKNN::new_with_library(
-        &lib,
+        lib,
         &mut std::fs::read(&args.mel_spec)?,
         0,
     )?);
 
-    let enc_kv = EncKvModel::<WhisperMedium>::new(RKNN::new_with_library(
-        &lib,
+    let enc_kv = EncKvModel::<S>::new(RKNN::new_with_library(
+        lib,
         &mut std::fs::read(&args.enc_kv)?,
         0,
     )?);
 
-    let dec_rknn = RKNN::new_with_library(&lib, &mut std::fs::read(&args.decoder)?, 0)?;
-    let mut decoder = WhisperDecoder::<WhisperMedium>::new(&dec_rknn);
+    let dec_rknn = RKNN::new_with_library(lib, &mut std::fs::read(&args.decoder)?, 0)?;
+    let mut decoder = WhisperDecoder::<S>::new(&dec_rknn);
 
     let text = transcribe(
         &args.wav.to_string_lossy(),
