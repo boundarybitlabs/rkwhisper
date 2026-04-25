@@ -15,6 +15,8 @@ pub mod cache;
 pub mod decoder;
 pub mod encoder;
 pub mod spec;
+pub mod suppression;
+pub mod vad;
 pub mod whisper;
 
 pub const N_SAMPLES: usize = SAMPLE_RATE as usize * 30;
@@ -95,7 +97,7 @@ impl MelSpectrogram {
     }
 }
 
-fn load_audio_file(path: &str) -> Result<Vec<f32>, anyhow::Error> {
+pub fn load_audio_file(path: &str) -> Result<Vec<f32>, anyhow::Error> {
     let mut reader = hound::WavReader::open(path)
         .with_context(|| format!("Failed to open WAV file: {:?}", path))?;
     let spec = reader.spec();
