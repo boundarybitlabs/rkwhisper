@@ -70,9 +70,10 @@ pub fn transcribe<S: WhisperSpec>(
                 }
             }
 
-            // Suppress timestamps (everything after NoTimestamps)
-            for i in (tok_notimestamps as usize + 1)..logits.len() {
-                logits[i] = -1e4;
+            if notimestamps {
+                for i in (tok_notimestamps as usize + 1)..logits.len() {
+                    logits[i] = -1e4;
+                }
             }
         };
 

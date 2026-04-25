@@ -154,10 +154,10 @@ It supports two token selection modes:
 - greedy decoding when `beam_size == 1`
 - beam search when `beam_size > 1`
 
-Both modes suppress control tokens after the prompt. The current suppression
-logic also suppresses timestamp tokens unconditionally. EOT is suppressed for
-the first generated token. A repeated 4-token pattern is used as a simple
-loop-break condition.
+Both modes suppress control tokens after the prompt. Timestamp tokens are only
+suppressed when `--notimestamps` is set. EOT is suppressed for the first
+generated token. A repeated 4-token pattern is used as a simple loop-break
+condition.
 
 ## Beam Search
 
