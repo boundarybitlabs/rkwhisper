@@ -5,13 +5,17 @@ use rkwhisper::{
     MelSpectrogram,
     decoder::WhisperDecoder,
     encoder::{EncKvModel, WhisperEncoder},
-    spec::{WhisperLargeV3Turbo, WhisperMedium, WhisperSmall, WhisperSpec},
+    spec::{
+        WhisperBase, WhisperLargeV3Turbo, WhisperMedium, WhisperSmall, WhisperSpec, WhisperTiny,
+    },
     whisper::transcribe,
 };
 use std::path::{Path, PathBuf};
 
 #[derive(ValueEnum, Clone, Debug)]
 enum Model {
+    Tiny,
+    Base,
     Small,
     Medium,
     LargeV3Turbo,
@@ -77,6 +81,8 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Could not find rknn library"))?;
 
     match args.model {
+        Model::Tiny => run::<WhisperTiny>(args, &lib),
+        Model::Base => run::<WhisperBase>(args, &lib),
         Model::Small => run::<WhisperSmall>(args, &lib),
         Model::Medium => run::<WhisperMedium>(args, &lib),
         Model::LargeV3Turbo => run::<WhisperLargeV3Turbo>(args, &lib),

@@ -102,11 +102,12 @@ model sizes without runtime shape branching inside the hot paths.
 
 - accepts encoder hidden states
 - runs a separate RKNN model that computes cross-attention K/V tensors
-- returns per-layer encoder K and V buffers
+- returns per-layer encoder K and V buffers in logical
+  `[1, ENC_SEQ, N_HEADS, D_HEAD]` layout
 - expects one K and one V output per decoder layer
 
-The encoder-KV output is later transposed by the decoder wrapper into the
-layout expected by the decoder RKNN graph.
+The decoder wrapper packs the encoder-KV output into the decoder RKNN graph's
+native `NC1HWC2` `enc_k_l*` and `enc_v_l*` input layout.
 
 ## Decoder and KV Cache
 
@@ -119,7 +120,8 @@ layout expected by the decoder RKNN graph.
 - `pos`
 
 The state is cloneable so beam search can branch independently. Each cache
-buffer is stored per layer in NHWC layout `[1, T_CACHE, D_HEAD, N_HEADS]`.
+buffer is stored per layer in native `NC1HWC2` layout
+`[1, ceil(N_HEADS/8), T_CACHE, D_HEAD, 8]`.
 
 `WhisperDecoder<S>` owns:
 
@@ -138,8 +140,8 @@ For each token step, it:
 5. Writes present K/V back into the ring-style cache slot.
 6. Increments the decoder position.
 
-Helper functions handle the tensor-layout conversions between encoder-KV output,
-decoder input, decoder present output, and cache storage.
+Helper functions copy packed decoder present outputs back into the packed cache
+slot for the next token step.
 
 ## Decoding
 
