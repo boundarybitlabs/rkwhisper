@@ -109,12 +109,26 @@ pub fn transcribe_with_options<S: WhisperSpec>(
 ) -> Result<Transcription> {
     let tokenizer = Tokenizer::from_file(tokenizer_path)
         .map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
-
     let audio = load_audio_file(audio_path)?;
+    transcribe_audio_with_options(
+        &audio, &tokenizer, mel_spec, encoder, enc_kv, decoder, vad, options,
+    )
+}
+
+pub fn transcribe_audio_with_options<S: WhisperSpec>(
+    audio: &[f32],
+    tokenizer: &Tokenizer,
+    mel_spec: &MelSpectrogram,
+    encoder: &WhisperEncoder<S>,
+    enc_kv: &EncKvModel<S>,
+    decoder: &mut WhisperDecoder<S>,
+    vad: Option<&VadModel>,
+    options: &TranscribeOptions,
+) -> Result<Transcription> {
     let mut state = WhisperDecoderState::new::<S>();
     let vad_enabled = vad.is_some();
     let vad_segments = if let Some(vad) = vad {
-        vad.segments(&audio)?
+        vad.segments(audio)?
     } else {
         Vec::new()
     };
@@ -141,7 +155,7 @@ pub fn transcribe_with_options<S: WhisperSpec>(
         decoder.set_enc_kv(enc_k, enc_v);
 
         let prompt = control_prompt(
-            &tokenizer,
+            tokenizer,
             &options.lang,
             &options.task,
             options.notimestamps,
@@ -159,7 +173,7 @@ pub fn transcribe_with_options<S: WhisperSpec>(
         let tok_notimestamps = tokenizer.token_to_id("<|notimestamps|>").unwrap();
         let prompt_len = prompt.len();
         let suppressor = TokenSuppressor::new::<S>(
-            &tokenizer,
+            tokenizer,
             prompt_len,
             options.notimestamps,
             &options.suppress_tokens,
@@ -223,7 +237,7 @@ pub fn transcribe_with_options<S: WhisperSpec>(
         full_text.push_str(&window_text);
         full_text.push(' ');
         segments.extend(tokens_to_segments(
-            &tokenizer,
+            tokenizer,
             output_tokens,
             window.index,
             samples_to_sec(window.start_sample),
