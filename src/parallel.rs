@@ -3,8 +3,8 @@ use crate::encoder::{EncKvModel, WhisperEncoder};
 use crate::spec::WhisperSpec;
 use crate::vad::VadModel;
 use crate::whisper::{
-    AudioWindow, TranscribeOptions, Transcription, WindowTranscription, transcribe_audio_window,
-    transcription_windows,
+    AudioWindow, TranscribeOptions, TranscriptSegment, Transcription, WindowTranscription,
+    transcribe_audio_window, transcription_windows,
 };
 use crate::{MelSpectrogram, load_audio_file};
 use anyhow::{Context, Result, anyhow};
@@ -216,6 +216,20 @@ impl<S: WhisperSpec + Send + 'static> ParallelTranscriberPool<S> {
         vad: Option<&VadModel>,
         options: &TranscribeOptions,
     ) -> Result<Transcription> {
+        self.transcribe_audio_with_segment_callback(audio, tokenizer, vad, options, |_| Ok(()))
+    }
+
+    pub fn transcribe_audio_with_segment_callback<F>(
+        &mut self,
+        audio: &[f32],
+        tokenizer: Arc<Tokenizer>,
+        vad: Option<&VadModel>,
+        options: &TranscribeOptions,
+        on_segment: F,
+    ) -> Result<Transcription>
+    where
+        F: FnMut(&TranscriptSegment) -> Result<()>,
+    {
         let vad_segments = if let Some(vad) = vad {
             vad.segments(audio)?
         } else {
@@ -244,7 +258,8 @@ impl<S: WhisperSpec + Send + 'static> ParallelTranscriberPool<S> {
         self.runtime.block_on(async {
             let dispatched =
                 dispatch_windows(windows, worker_txs, ready_rx, audio, tokenizer, options);
-            let collected = collect_ordered(result_rx, total_windows, vad_segments);
+            let collected =
+                collect_ordered_with_callback(result_rx, total_windows, vad_segments, on_segment);
             let (_, transcription) = tokio::try_join!(dispatched, collected)?;
             Ok(transcription)
         })
@@ -347,11 +362,15 @@ async fn dispatch_windows(
     Ok(())
 }
 
-async fn collect_ordered(
+async fn collect_ordered_with_callback<F>(
     result_rx: &mut mpsc::Receiver<Result<WindowTranscription>>,
     total_windows: usize,
     vad_segments: Vec<crate::vad::VadSegment>,
-) -> Result<Transcription> {
+    mut on_segment: F,
+) -> Result<Transcription>
+where
+    F: FnMut(&TranscriptSegment) -> Result<()>,
+{
     let mut pending = BTreeMap::<usize, WindowTranscription>::new();
     let mut next = 0usize;
     let mut full_text = String::new();
@@ -367,6 +386,9 @@ async fn collect_ordered(
         while let Some(result) = pending.remove(&next) {
             full_text.push_str(&result.text);
             full_text.push(' ');
+            for segment in &result.segments {
+                on_segment(segment)?;
+            }
             segments.extend(result.segments);
             next += 1;
         }
@@ -381,7 +403,7 @@ async fn collect_ordered(
 
 #[cfg(test)]
 mod tests {
-    use super::collect_ordered;
+    use super::collect_ordered_with_callback;
     use crate::whisper::WindowTranscription;
     use tokio::sync::mpsc;
 
@@ -394,7 +416,9 @@ mod tests {
         drop(tx);
 
         let mut rx = rx;
-        let transcription = collect_ordered(&mut rx, 3, Vec::new()).await.unwrap();
+        let transcription = collect_ordered_with_callback(&mut rx, 3, Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
         assert_eq!(transcription.text, "one two three");
     }
 
@@ -402,7 +426,9 @@ mod tests {
     async fn collect_ordered_reports_early_close() {
         let (_tx, rx) = mpsc::channel(1);
         let mut rx = rx;
-        let error = collect_ordered(&mut rx, 1, Vec::new()).await.unwrap_err();
+        let error = collect_ordered_with_callback(&mut rx, 1, Vec::new(), |_| Ok(()))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("result channel closed"));
     }
 

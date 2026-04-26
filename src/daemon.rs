@@ -107,10 +107,7 @@ pub fn parse_config(contents: &str) -> Result<DaemonConfig> {
 pub fn read_request<R: Read>(reader: &mut R) -> Result<DaemonRequest> {
     let header = read_header(reader)?;
 
-    if header.mode != "batch" {
-        if header.mode == "stream" {
-            bail!("stream mode is not supported in v1");
-        }
+    if header.mode != "batch" && header.mode != "stream" {
         bail!("unsupported mode {:?}", header.mode);
     }
     if header.beam_size == 0 {
@@ -342,16 +339,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_stream_mode_for_v1() {
+    fn reads_framed_stream_request() {
         let mut bytes = br#"{"model":"whisper-small-30s","mode":"stream"}"#.to_vec();
         bytes.push(b'\n');
         bytes.extend_from_slice(&2i32.to_le_bytes());
         bytes.extend_from_slice(&0i16.to_le_bytes());
 
-        let err = read_request(&mut Cursor::new(bytes))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("stream mode is not supported"));
+        let request = read_request(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(request.header.mode, "stream");
+        assert_eq!(request.audio, vec![0.0]);
     }
 
     #[test]
