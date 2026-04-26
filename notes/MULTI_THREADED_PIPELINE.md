@@ -1,210 +1,297 @@
-# RK3588 RKNN Whisper pipeline — multithreaded design
+# RK3588 RKNN Whisper pipeline - Tokio multi-NPU design
 
 ## Overview
 
-The RK3588 NPU exposes three independent 2 TOPS cores. Rather than fusing all three into a single 6 TOPS context for one large model, this design runs **three independent Whisper pipelines in parallel**, each pinned to a different core and each processing a different audio window. Throughput scales linearly with the number of cores.
+The RK3588 NPU exposes three independent cores. This design runs three
+independent Whisper pipelines in parallel, with one long-lived worker per NPU
+core. Tokio coordinates input windows, worker readiness, backpressure, result
+collection, and shutdown; RKNN inference itself remains synchronous and
+worker-local.
 
-A Rayon thread pool with exactly `num_threads(3)` manages dispatch. Each worker thread owns one pair of RKNN contexts (encoder + decoder) stored in `thread_local!` storage, permanently bound to its assigned NPU core via `rknn_set_core_mask()`.
+The important rule is ownership: each worker owns a full RKNN context set for
+one core:
+
+- mel spectrogram
+- encoder
+- encoder-KV
+- decoder RKNN handle plus `WhisperDecoder`
+
+Do not share RKNN contexts with `Arc<Mutex<_>>`. The current `rknpu2::RKNN`
+handle is a thin wrapper around an RKNN context and should be treated as
+thread-affine. All calls to `set_inputs`, `run`, and `get_outputs` happen on the
+same worker thread that created and pinned the contexts.
 
 ---
 
-## Pipeline stages (per core)
+## Pipeline stages
 
-Each audio window passes through three stages in sequence:
+VAD runs before fanout because it determines the audio windows. Once windows
+exist, each window is independent and can be processed by any available NPU
+worker.
 
-| Stage | Where | Description |
+| Stage | Owner | Description |
 |---|---|---|
-| Mel spectrogram | CPU | Log-mel filterbank, 80 bins × 3000 frames (30 s @ 16 kHz) |
-| Encoder | NPU | Single forward pass → cross-attention KV cache |
-| Decoder loop | NPU | Autoregressive token generation until `<EOT>` |
+| VAD windowing | caller / coordinator | Builds fixed 30-second windows or VAD-derived windows |
+| Mel spectrogram | worker NPU context | Runs `mel.rknn` and post-processes log-mel features |
+| Encoder | worker NPU context | Runs `encoder.rknn` once per window |
+| Encoder-KV | worker NPU context | Runs `enc_kv.rknn` once per window |
+| Decoder loop | worker NPU context | Runs `decoder.rknn` once per prompt/generated token |
 
-The encoder runs once per window. The decoder runs N times (one step per output token), so windows with verbose audio take proportionally longer — this is why work-stealing matters.
+The decoder loop dominates runtime and varies with output length. Static
+round-robin dispatch would leave cores idle when one window generates many more
+tokens than the others, so the Tokio dispatcher assigns work to whichever worker
+announces readiness first.
 
 ---
 
-## Thread pool construction
+## Core masks
+
+For RK3588, start exactly three workers:
 
 ```rust
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+const NPU_WORKERS: usize = 3;
 
-thread_local! {
-    static WHISPER_CTX: RefCell<Option<WhisperCtx>> = RefCell::new(None);
-}
+const CORE_MASKS: [u32; NPU_WORKERS] = [
+    RKNN::<RuntimeAPI>::NPU_CORE_0,
+    RKNN::<RuntimeAPI>::NPU_CORE_1,
+    RKNN::<RuntimeAPI>::NPU_CORE_2,
+];
+```
 
-static CORE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+Each worker calls `set_core_mask(core_mask)` immediately after constructing
+each RKNN context:
 
-pub fn build_whisper_pool(
-    encoder_model: Arc<Vec<u8>>,
-    decoder_model: Arc<Vec<u8>>,
-) -> rayon::ThreadPool {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(3)
-        .start_handler(move |_| {
-            let core_id = CORE_COUNTER.fetch_add(1, Ordering::SeqCst) % 3;
-            let core_mask = 1u32 << core_id;
-            WHISPER_CTX.with(|cell| {
-                *cell.borrow_mut() = Some(
-                    WhisperCtx::new(&encoder_model, &decoder_model, core_mask, core_id)
-                        .expect("RKNN init failed"),
-                );
-            });
-        })
-        .exit_handler(|_| {
-            WHISPER_CTX.with(|cell| drop(cell.borrow_mut().take()));
-        })
-        .build()
-        .unwrap()
+```rust
+let mel = RKNN::new_with_library(lib, &mut mel_model, 0)?;
+mel.set_core_mask(core_mask)?;
+
+let encoder = RKNN::new_with_library(lib, &mut encoder_model, 0)?;
+encoder.set_core_mask(core_mask)?;
+
+let enc_kv = RKNN::new_with_library(lib, &mut enc_kv_model, 0)?;
+enc_kv.set_core_mask(core_mask)?;
+
+let decoder_rknn = RKNN::new_with_library(lib, &mut decoder_model, 0)?;
+decoder_rknn.set_core_mask(core_mask)?;
+```
+
+All contexts for a window stay on one NPU core. Avoid using
+`NPU_CORE_0_1_2` for this design; that mode asks one model instance to use all
+cores and prevents concurrent per-window scheduling.
+
+---
+
+## Worker-owned pipeline context
+
+Wrap the existing model wrappers in a worker-local context. The exact model spec
+remains generic over `WhisperSpec`.
+
+```rust
+struct PipelineCtx<S: WhisperSpec> {
+    core_id: usize,
+    mel_spec: MelSpectrogram,
+    encoder: WhisperEncoder<S>,
+    enc_kv: EncKvModel<S>,
+    decoder_rknn: RKNN<RuntimeAPI>,
+    decoder: WhisperDecoder<'static, S>,
 }
 ```
 
-`num_threads(3)` is load-bearing — if the pool grows larger, multiple threads would contend for the same NPU core. `start_handler` fires once per worker thread at pool creation, so the pool is fully ready (all three RKNN contexts initialized) before any work is submitted.
+In real code, avoid forcing a fake `'static` lifetime. Prefer one of these
+shapes:
+
+- make `WhisperDecoder<S>` own its `RKNN<RuntimeAPI>` instead of borrowing it, or
+- store `decoder_rknn` and construct a short-lived `WhisperDecoder` inside
+  `transcribe_window`.
+
+`PipelineCtx::transcribe_window(...)` should contain the current per-window body
+from `transcribe_audio_with_options`: log-mel, encode, enc-KV, prompt, greedy or
+beam decode, token decode, and `TranscriptSegment` construction.
 
 ---
 
-## RKNN context wrapper
+## Tokio orchestration
+
+Tokio owns the control plane:
+
+- one bounded job channel per worker
+- one shared ready channel
+- one shared result channel
+- one dispatcher task
+- one collector/reorder task
+
+The workers themselves run on dedicated OS threads. Do not use Tokio's general
+worker pool for RKNN inference, because the model contexts must remain attached
+to their owning thread and NPU core.
 
 ```rust
-pub struct WhisperCtx {
-    encoder: RknnHandle,
-    decoder: RknnHandle,
-    pub core_id: usize,
+struct Job {
+    window: AudioWindow,
+    audio: Arc<[f32]>,
+    tokenizer: Arc<Tokenizer>,
+    options: Arc<TranscribeOptions>,
 }
 
-// SAFETY: each WhisperCtx lives entirely on its owning Rayon worker thread.
-// thread_local! guarantees no concurrent access.
-unsafe impl Send for WhisperCtx {}
+struct Ready {
+    worker_id: usize,
+}
 
-impl WhisperCtx {
-    pub fn new(
-        encoder_model: &[u8],
-        decoder_model: &[u8],
-        core_mask: u32,
-        core_id: usize,
-    ) -> anyhow::Result<Self> {
-        let encoder = RknnHandle::load(encoder_model)?;
-        encoder.set_core_mask(core_mask)?;
+struct WindowResult {
+    window_index: usize,
+    text: String,
+    segments: Vec<TranscriptSegment>,
+}
+```
 
-        let decoder = RknnHandle::load(decoder_model)?;
-        decoder.set_core_mask(core_mask)?;
+Worker startup:
 
-        Ok(Self { encoder, decoder, core_id })
+```rust
+fn spawn_npu_worker<S: WhisperSpec + Send + 'static>(
+    worker_id: usize,
+    core_mask: u32,
+    model_bytes: Arc<ModelBytes>,
+    ready_tx: tokio::sync::mpsc::Sender<Ready>,
+    result_tx: tokio::sync::mpsc::Sender<anyhow::Result<WindowResult>>,
+) -> tokio::sync::mpsc::Sender<Job> {
+    let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<Job>(1);
+
+    std::thread::Builder::new()
+        .name(format!("rkwhisper-npu-{worker_id}"))
+        .spawn(move || {
+            let mut ctx = PipelineCtx::<S>::load(model_bytes, core_mask, worker_id)?;
+
+            ready_tx.blocking_send(Ready { worker_id })?;
+
+            while let Some(job) = job_rx.blocking_recv() {
+                let result = ctx.transcribe_window(job);
+                result_tx.blocking_send(result)?;
+                ready_tx.blocking_send(Ready { worker_id })?;
+            }
+
+            anyhow::Ok(())
+        })
+        .expect("failed to spawn NPU worker");
+
+    job_tx
+}
+```
+
+The bounded job channel is intentional. A worker should have at most one queued
+window, which keeps memory bounded and keeps readiness meaningful.
+
+---
+
+## Dynamic dispatch
+
+The dispatcher keeps a queue of pending windows and sends the next window to the
+next ready worker.
+
+```rust
+async fn dispatch_windows(
+    windows: Vec<AudioWindow>,
+    worker_txs: Vec<tokio::sync::mpsc::Sender<Job>>,
+    mut ready_rx: tokio::sync::mpsc::Receiver<Ready>,
+    audio: Arc<[f32]>,
+    tokenizer: Arc<Tokenizer>,
+    options: Arc<TranscribeOptions>,
+) -> anyhow::Result<()> {
+    let mut pending = std::collections::VecDeque::from(windows);
+
+    while let Some(window) = pending.pop_front() {
+        let ready = ready_rx.recv().await
+            .ok_or_else(|| anyhow::anyhow!("all NPU workers stopped"))?;
+
+        let job = Job {
+            window,
+            audio: audio.clone(),
+            tokenizer: tokenizer.clone(),
+            options: options.clone(),
+        };
+
+        worker_txs[ready.worker_id].send(job).await?;
     }
 
-    pub fn transcribe(&mut self, window: &AudioWindow) -> String {
-        let mel = compute_log_mel(&window.samples, 80, 400, 160);
-        let kv_cache = self.encoder.run(&[&mel]).expect("encoder failed");
-
-        let mut tokens: Vec<i32> = vec![SOT_TOKEN, LANG_TOKEN, TRANSCRIBE_TOKEN];
-        loop {
-            let logits = self.decoder
-                .run(&[&kv_cache, &tokens_tensor(&tokens)])
-                .expect("decoder step failed");
-            let next = greedy_sample(&logits);
-            if next == EOT_TOKEN || tokens.len() > 448 { break; }
-            tokens.push(next);
-        }
-
-        decode_bpe(&tokens[3..])
-    }
+    Ok(())
 }
 ```
 
----
-
-## Streaming dispatch
-
-```rust
-pub struct AudioWindow {
-    pub id: u64,           // monotonic sequence number for reordering
-    pub samples: Vec<f32>,
-    pub timestamp_ms: u64,
-}
-
-pub fn run_pipeline(
-    pool: &rayon::ThreadPool,
-    window_rx: Receiver<AudioWindow>,
-    result_tx: Sender<(u64, String)>,
-) {
-    pool.scope(|s| {
-        for window in window_rx {
-            let result_tx = result_tx.clone();
-            s.spawn(move |_| {
-                let transcript = WHISPER_CTX.with(|cell| {
-                    cell.borrow_mut()
-                        .as_mut()
-                        .expect("thread has no WhisperCtx")
-                        .transcribe(&window)
-                });
-                result_tx.send((window.id, transcript)).unwrap();
-            });
-        }
-    });
-}
-```
-
-`rayon::scope` blocks until all spawned tasks complete. Work-stealing means that if one core is running a long decoder (verbose audio), another core immediately picks up the next pending window — a round-robin dispatch would leave cores idle in this situation.
+This gives Rayon-style load balancing without Rayon. A verbose window ties up
+only its own worker; the next completed worker immediately receives the next
+pending window.
 
 ---
 
 ## Result reordering
 
-Work-stealing may complete windows out of order. A min-heap keyed on `window.id` reconstructs the correct sequence:
+Results may complete out of order. Buffer by `window_index` and emit segments
+only when the next expected index is available.
 
 ```rust
-use std::collections::BinaryHeap;
-use std::cmp::Reverse;
+async fn collect_ordered(
+    mut result_rx: tokio::sync::mpsc::Receiver<anyhow::Result<WindowResult>>,
+    total_windows: usize,
+) -> anyhow::Result<Transcription> {
+    let mut pending = std::collections::BTreeMap::<usize, WindowResult>::new();
+    let mut next = 0usize;
+    let mut full_text = String::new();
+    let mut segments = Vec::new();
 
-pub fn collect_ordered(result_rx: Receiver<(u64, String)>, total: usize) -> Vec<String> {
-    let mut heap: BinaryHeap<(Reverse<u64>, String)> = BinaryHeap::new();
-    let mut out = Vec::with_capacity(total);
-    let mut next_expected = 0u64;
+    while next < total_windows {
+        let result = result_rx.recv().await
+            .ok_or_else(|| anyhow::anyhow!("result channel closed early"))??;
+        pending.insert(result.window_index, result);
 
-    for (id, text) in result_rx.iter().take(total) {
-        heap.push((Reverse(id), text));
-        while heap.peek().map(|(Reverse(id), _)| *id) == Some(next_expected) {
-            let (_, t) = heap.pop().unwrap();
-            out.push(t);
-            next_expected += 1;
+        while let Some(result) = pending.remove(&next) {
+            full_text.push_str(&result.text);
+            full_text.push(' ');
+            segments.extend(result.segments);
+            next += 1;
         }
     }
-    out
+
+    Ok(Transcription {
+        text: full_text.trim().to_string(),
+        segments,
+        vad_segments: Vec::new(),
+    })
 }
 ```
 
----
-
-## Key design decisions
-
-**`thread_local!` instead of `Arc<Mutex<_>>`.**
-RKNN contexts are not thread-safe. Wrapping them in a mutex would serialize all NPU access, defeating the purpose. `thread_local!` gives each worker its own context with zero synchronization overhead — the context never moves or is shared.
-
-**`AtomicUsize` for core assignment.**
-Rayon starts all three threads roughly simultaneously, so thread indices may not arrive at `start_handler` in order. `fetch_add` mod 3 guarantees each thread gets a unique core ID regardless of scheduling order.
-
-**Separate encoder/decoder models.**
-Splitting Whisper into `encoder.rknn` and `decoder.rknn` (the standard RKNN port layout) means both models on a given thread share the same `core_mask`. All compute for one audio window stays on a single NPU core, avoiding cross-core cache pressure.
-
-**`num_threads(3)` is a hard constraint.**
-Increasing thread count beyond 3 would cause multiple threads to share a core mask, creating contention inside the RKNN runtime. If you need a larger Rayon pool elsewhere in your application, build this as an isolated `ThreadPool` instance rather than using the global pool.
+When VAD is enabled, carry the precomputed `vad_segments` outside this collector
+and attach them to the final `Transcription`.
 
 ---
 
-## Optional: CPU core affinity
+## Shutdown and errors
 
-Rayon workers can be rescheduled by the OS onto any CPU core. To also pin each worker to a specific A76 or A55 cluster, call `core_affinity::set_for_current()` inside `start_handler` before the RKNN init:
+Dropping all worker job senders closes the worker channels. Each worker finishes
+its current window, exits its receive loop, and drops RKNN contexts on the same
+thread that created them.
+
+If any worker returns an error, the coordinator should:
+
+1. drop all job senders to stop future work;
+2. drain or close the result channel;
+3. return the first error with the worker ID and window index attached.
+
+For daemon use, keep workers alive across requests only when the model is fixed.
+If requests can select different models, use a pool key of `(model_id,
+model_kind)` and create one three-worker pool per loaded model, or keep the v1
+daemon request-scoped and accept model reload cost.
+
+---
+
+## Optional CPU affinity
+
+NPU core masks do not pin the CPU thread. For lower latency jitter, optionally
+pin each worker thread to a big CPU core before loading RKNN contexts:
 
 ```rust
-.start_handler(move |_| {
-    let core_id = CORE_COUNTER.fetch_add(1, Ordering::SeqCst) % 3;
-    // Pin to a big core (A76 cluster starts at logical core 4 on RK3588)
-    core_affinity::set_for_current(core_affinity::CoreId { id: 4 + core_id });
-    // ... then init RKNN context as normal
-})
+core_affinity::set_for_current(core_affinity::CoreId { id: 4 + worker_id });
 ```
 
-This reduces latency jitter on the mel spectrogram computation (which runs on CPU) by preventing the scheduler from migrating the thread mid-window.
+This keeps CPU-side preprocessing and decoder bookkeeping from migrating while a
+worker is processing a window.
 
 ---
 
@@ -212,10 +299,25 @@ This reduces latency jitter on the mel spectrogram computation (which runs on CP
 
 ```toml
 [dependencies]
-rayon            = "1.8"
-crossbeam-channel = "0.5"
-anyhow           = "1"
-core_affinity    = "0.8"   # optional, for CPU pinning
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+core_affinity = "0.8" # optional
 ```
 
-RKNN bindings: use `rknn-rs` if available for your SDK version, or write thin `unsafe` FFI wrappers over `librknnrt.so` directly.
+Tokio is not used to run RKNN calls concurrently on the same context. Its role is
+coordination: bounded queues, readiness, cancellation, and ordered result
+assembly.
+
+---
+
+## Test plan
+
+- Unit-test the dispatcher with fake workers that complete windows out of order.
+- Unit-test result reordering for already-ordered, reversed, and delayed
+  results.
+- Unit-test bounded worker queues so each worker has at most one queued job.
+- Integration-test on RK3588 with long audio:
+  - all three workers initialize;
+  - each worker reports a distinct core mask;
+  - output text and segments remain ordered by window index;
+  - throughput improves versus the current serial path.
