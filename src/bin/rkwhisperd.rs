@@ -2,21 +2,20 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use rknpu2::{RKNN, utils::find_rknn_library};
 use rkwhisper::{
-    MelSpectrogram,
     daemon::{
         DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH, DaemonConfig, DaemonRequest, DaemonResponse,
         ModelFiles, ModelKind, default_model_root, load_config, resolve_enabled_model_files,
         response_line,
     },
-    decoder::WhisperDecoder,
-    encoder::{EncKvModel, WhisperEncoder},
+    parallel::{ParallelModelPaths, ParallelTranscriberPool},
     spec::{
         WhisperBase, WhisperLargeV3Turbo, WhisperMedium, WhisperSmall, WhisperSpec, WhisperTiny,
     },
     suppression::SuppressTokens,
     vad::{VadConfig, VadModel},
-    whisper::{TranscribeOptions, transcribe_audio_with_options},
+    whisper::{TranscribeOptions, Transcription},
 };
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -24,6 +23,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
@@ -50,19 +50,20 @@ fn main() -> Result<()> {
     let lib = find_rknn_library()
         .next()
         .ok_or_else(|| anyhow::anyhow!("Could not find rknn library"))?;
+    let mut pools = DaemonPools::load(&model_root, &config, &lib)?;
 
     let listener = bind_socket(&args.socket)?;
     eprintln!(
-        "rkwhisperd listening on {} with model root {} and {} enabled model(s)",
+        "rkwhisperd listening on {} with model root {} and {} enabled model pool(s)",
         args.socket.display(),
         model_root.display(),
-        config.models.len()
+        pools.len()
     );
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle_connection(stream, &model_root, &config, &lib) {
+                if let Err(error) = handle_connection(stream, &mut pools, &lib) {
                     eprintln!("request failed: {error:#}");
                 }
             }
@@ -131,12 +132,7 @@ fn group_id(name: &str) -> Result<Option<u32>> {
     Ok(None)
 }
 
-fn handle_connection(
-    mut stream: UnixStream,
-    model_root: &Path,
-    config: &DaemonConfig,
-    lib: &Path,
-) -> Result<()> {
+fn handle_connection(mut stream: UnixStream, pools: &mut DaemonPools, lib: &Path) -> Result<()> {
     let request = match rkwhisper::daemon::read_request(&mut stream) {
         Ok(request) => request,
         Err(error) => {
@@ -149,7 +145,7 @@ fn handle_connection(
     let started = Instant::now();
     let audio_s = rkwhisper::daemon::audio_seconds(request.audio.len());
 
-    match transcribe_request(model_root, config, lib, &request) {
+    match pools.transcribe_request(lib, &request) {
         Ok(transcription) => {
             for segment in &transcription.segments {
                 writer.write_all(
@@ -189,75 +185,123 @@ fn write_error(stream: &mut UnixStream, error: &str) -> Result<()> {
     Ok(())
 }
 
-fn transcribe_request(
-    model_root: &Path,
-    config: &DaemonConfig,
-    lib: &Path,
-    request: &DaemonRequest,
-) -> Result<rkwhisper::whisper::Transcription> {
-    let files = resolve_enabled_model_files(model_root, config, &request.header.model)?;
-    match files.kind {
-        ModelKind::Tiny => transcribe_with_model::<WhisperTiny>(lib, &files, request),
-        ModelKind::Base => transcribe_with_model::<WhisperBase>(lib, &files, request),
-        ModelKind::Small => transcribe_with_model::<WhisperSmall>(lib, &files, request),
-        ModelKind::Medium => transcribe_with_model::<WhisperMedium>(lib, &files, request),
-        ModelKind::LargeV3Turbo => {
-            transcribe_with_model::<WhisperLargeV3Turbo>(lib, &files, request)
+struct DaemonPools {
+    pools: HashMap<String, ModelPool>,
+}
+
+impl DaemonPools {
+    fn load(model_root: &Path, config: &DaemonConfig, lib: &Path) -> Result<Self> {
+        let mut pools = HashMap::new();
+        for model_id in &config.models {
+            let files = resolve_enabled_model_files(model_root, config, model_id)
+                .with_context(|| format!("failed to resolve model {model_id}"))?;
+            let pool = ModelPool::load(lib, files)
+                .with_context(|| format!("failed to load model pool {model_id}"))?;
+            pools.insert(model_id.clone(), pool);
+        }
+        Ok(Self { pools })
+    }
+
+    fn len(&self) -> usize {
+        self.pools.len()
+    }
+
+    fn transcribe_request(&mut self, lib: &Path, request: &DaemonRequest) -> Result<Transcription> {
+        let pool = self
+            .pools
+            .get_mut(&request.header.model)
+            .ok_or_else(|| anyhow::anyhow!("model not found"))?;
+        pool.transcribe(lib, request)
+    }
+}
+
+enum ModelPool {
+    Tiny(TypedModelPool<WhisperTiny>),
+    Base(TypedModelPool<WhisperBase>),
+    Small(TypedModelPool<WhisperSmall>),
+    Medium(TypedModelPool<WhisperMedium>),
+    LargeV3Turbo(TypedModelPool<WhisperLargeV3Turbo>),
+}
+
+impl ModelPool {
+    fn load(lib: &Path, files: ModelFiles) -> Result<Self> {
+        match files.kind {
+            ModelKind::Tiny => Ok(Self::Tiny(TypedModelPool::<WhisperTiny>::load(lib, files)?)),
+            ModelKind::Base => Ok(Self::Base(TypedModelPool::<WhisperBase>::load(lib, files)?)),
+            ModelKind::Small => Ok(Self::Small(TypedModelPool::<WhisperSmall>::load(
+                lib, files,
+            )?)),
+            ModelKind::Medium => Ok(Self::Medium(TypedModelPool::<WhisperMedium>::load(
+                lib, files,
+            )?)),
+            ModelKind::LargeV3Turbo => Ok(Self::LargeV3Turbo(
+                TypedModelPool::<WhisperLargeV3Turbo>::load(lib, files)?,
+            )),
+        }
+    }
+
+    fn transcribe(&mut self, lib: &Path, request: &DaemonRequest) -> Result<Transcription> {
+        match self {
+            Self::Tiny(pool) => pool.transcribe(lib, request),
+            Self::Base(pool) => pool.transcribe(lib, request),
+            Self::Small(pool) => pool.transcribe(lib, request),
+            Self::Medium(pool) => pool.transcribe(lib, request),
+            Self::LargeV3Turbo(pool) => pool.transcribe(lib, request),
         }
     }
 }
 
-fn transcribe_with_model<S: WhisperSpec>(
-    lib: &Path,
-    files: &ModelFiles,
-    request: &DaemonRequest,
-) -> Result<rkwhisper::whisper::Transcription> {
-    let tokenizer = Tokenizer::from_file(&files.tokenizer)
-        .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
+struct TypedModelPool<S: WhisperSpec + Send + 'static> {
+    files: ModelFiles,
+    tokenizer: Arc<Tokenizer>,
+    pool: ParallelTranscriberPool<S>,
+}
 
-    let mel_spec = MelSpectrogram::new(RKNN::new_with_library(lib, &mut fs::read(&files.mel)?, 0)?);
-    let encoder = WhisperEncoder::<S>::new(RKNN::new_with_library(
-        lib,
-        &mut fs::read(&files.encoder)?,
-        0,
-    )?);
-    let enc_kv = EncKvModel::<S>::new(RKNN::new_with_library(
-        lib,
-        &mut fs::read(&files.enc_kv)?,
-        0,
-    )?);
-    let dec_rknn = RKNN::new_with_library(lib, &mut fs::read(&files.decoder)?, 0)?;
-    let mut decoder = WhisperDecoder::<S>::new(&dec_rknn);
+impl<S: WhisperSpec + Send + 'static> TypedModelPool<S> {
+    fn load(lib: &Path, files: ModelFiles) -> Result<Self> {
+        let tokenizer = Tokenizer::from_file(&files.tokenizer)
+            .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
+        let model_paths = ParallelModelPaths::new(
+            files.mel.clone(),
+            files.encoder.clone(),
+            files.enc_kv.clone(),
+            files.decoder.clone(),
+        );
+        let pool = ParallelTranscriberPool::<S>::new(lib, &model_paths)?;
+        Ok(Self {
+            files,
+            tokenizer: Arc::new(tokenizer),
+            pool,
+        })
+    }
 
-    let vad = if let Some(path) = &files.vad {
-        let config = vad_config_from_request(request);
-        Some(VadModel::new(
-            RKNN::new_with_library(lib, &mut fs::read(path)?, 0)?,
-            config,
-        ))
-    } else {
-        None
-    };
+    fn transcribe(&mut self, lib: &Path, request: &DaemonRequest) -> Result<Transcription> {
+        let vad = if let Some(path) = &self.files.vad {
+            let config = vad_config_from_request(request);
+            Some(VadModel::new(
+                RKNN::new_with_library(lib, &mut fs::read(path)?, 0)?,
+                config,
+            ))
+        } else {
+            None
+        };
 
-    let options = TranscribeOptions::new(
-        request.header.lang.clone(),
-        request.header.task.clone(),
-        request.header.notimestamps,
-        request.header.max_new_tokens,
-        request.header.beam_size,
-        SuppressTokens::parse(&request.header.suppress_tokens)?,
-    );
+        let options = TranscribeOptions::new(
+            request.header.lang.clone(),
+            request.header.task.clone(),
+            request.header.notimestamps,
+            request.header.max_new_tokens,
+            request.header.beam_size,
+            SuppressTokens::parse(&request.header.suppress_tokens)?,
+        );
 
-    transcribe_audio_with_options(
-        &request.audio,
-        &tokenizer,
-        &mel_spec,
-        &encoder,
-        &enc_kv,
-        &mut decoder,
-        vad.as_ref(),
-        &options,
-    )
+        self.pool.transcribe_audio_with_options(
+            &request.audio,
+            self.tokenizer.clone(),
+            vad.as_ref(),
+            &options,
+        )
+    }
 }
 
 fn vad_config_from_request(request: &DaemonRequest) -> VadConfig {
