@@ -65,8 +65,8 @@ impl<S: WhisperSpec> WhisperEncoder<S> {
 ///
 /// Expected model I/O (L = N_LAYERS):
 ///   Input  0          : xa  f16 [1, ENC_SEQ, HIDDEN]  UNDEFINED
-///   Outputs 0 ..= L-1 : enc_k_l*  f16 [1, D, H, S]   NHWC
-///   Outputs L ..= 2L-1: enc_v_l*  f16 [1, D, H, S]   NHWC
+///   Outputs 0 ..= L-1 : enc_k_l*  f16 [1, ENC_SEQ, N_HEADS, D_HEAD]
+///   Outputs L ..= 2L-1: enc_v_l*  f16 [1, ENC_SEQ, N_HEADS, D_HEAD]
 pub struct EncKvModel<S: WhisperSpec> {
     rknn: RKNN<RuntimeAPI>,
     phantom: std::marker::PhantomData<S>,
@@ -81,8 +81,7 @@ impl<S: WhisperSpec> EncKvModel<S> {
     }
 
     /// Returns `(enc_k, enc_v)`, each a `Vec` of `N_LAYERS` flat f16 buffers.
-    /// Each buffer is in NHWC [1, D_HEAD, N_HEADS, ENC_SEQ] order,
-    /// flat len = D * H * ENC_SEQ.
+    /// Each buffer is logical [1, ENC_SEQ, N_HEADS, D_HEAD] order.
     pub fn compute(&self, enc: &Encoded) -> Result<(Vec<Vec<f16>>, Vec<Vec<f16>>), rknpu2::Error> {
         self.rknn.set_inputs(vec![Input {
             index: 0,
@@ -93,7 +92,7 @@ impl<S: WhisperSpec> EncKvModel<S> {
         self.rknn.run()?;
 
         let l = S::N_LAYERS;
-        let per_layer_len = S::D_HEAD * S::N_HEADS * S::ENC_SEQ;
+        let per_layer_len = S::ENC_SEQ * S::N_HEADS * S::D_HEAD;
         let zero = f16::from_f32(0.0);
 
         let mut enc_k: Vec<Vec<f16>> = vec![vec![zero; per_layer_len]; l];
