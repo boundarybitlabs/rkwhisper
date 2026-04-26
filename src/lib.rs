@@ -12,8 +12,10 @@ use rknpu2::{
 
 pub mod beam;
 pub mod cache;
+pub mod daemon;
 pub mod decoder;
 pub mod encoder;
+pub mod parallel;
 pub mod spec;
 pub mod suppression;
 pub mod vad;

@@ -56,10 +56,17 @@ pub struct TranscriptSegment {
 }
 
 #[derive(Clone, Debug)]
-struct AudioWindow {
-    index: usize,
-    start_sample: usize,
-    end_sample: usize,
+pub(crate) struct AudioWindow {
+    pub(crate) index: usize,
+    pub(crate) start_sample: usize,
+    pub(crate) end_sample: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WindowTranscription {
+    pub(crate) window_index: usize,
+    pub(crate) text: String,
+    pub(crate) segments: Vec<TranscriptSegment>,
 }
 
 /// Transcribe arbitrary-length WAV with chunked 30-second encoder windows.
@@ -109,12 +116,25 @@ pub fn transcribe_with_options<S: WhisperSpec>(
 ) -> Result<Transcription> {
     let tokenizer = Tokenizer::from_file(tokenizer_path)
         .map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
-
     let audio = load_audio_file(audio_path)?;
-    let mut state = WhisperDecoderState::new::<S>();
+    transcribe_audio_with_options(
+        &audio, &tokenizer, mel_spec, encoder, enc_kv, decoder, vad, options,
+    )
+}
+
+pub fn transcribe_audio_with_options<S: WhisperSpec>(
+    audio: &[f32],
+    tokenizer: &Tokenizer,
+    mel_spec: &MelSpectrogram,
+    encoder: &WhisperEncoder<S>,
+    enc_kv: &EncKvModel<S>,
+    decoder: &mut WhisperDecoder<S>,
+    vad: Option<&VadModel>,
+    options: &TranscribeOptions,
+) -> Result<Transcription> {
     let vad_enabled = vad.is_some();
     let vad_segments = if let Some(vad) = vad {
-        vad.segments(&audio)?
+        vad.segments(audio)?
     } else {
         Vec::new()
     };
@@ -126,116 +146,149 @@ pub fn transcribe_with_options<S: WhisperSpec>(
     let mut full_text = String::new();
     let mut segments = Vec::new();
 
-    for window in windows {
-        let wave = &audio[window.start_sample..window.end_sample];
-        let mels = mel_spec.log_mel_spectrogram(wave)?;
-
-        let encoded = encoder
-            .encode(&mels)
-            .map_err(|e| anyhow!("encoder failed on window {}: {e}", window.index))?;
-
-        let (enc_k, enc_v) = enc_kv
-            .compute(&encoded)
-            .map_err(|e| anyhow!("enc-kv failed on window {}: {e}", window.index))?;
-
-        decoder.set_enc_kv(enc_k, enc_v);
-
-        let prompt = control_prompt(
-            &tokenizer,
-            &options.lang,
-            &options.task,
-            options.notimestamps,
+    for window in &windows {
+        let result = transcribe_audio_window(
+            audio, tokenizer, mel_spec, encoder, enc_kv, decoder, window, options,
         )?;
-
-        state.reset();
-        let mut last_logits = vec![0f32; S::VOCAB];
-        for (i, &id) in prompt.iter().enumerate() {
-            last_logits = decoder
-                .step(&mut state, id)
-                .map_err(|e| anyhow!("prime step {i} failed on window {}: {e}", window.index))?;
-        }
-
-        let tok_eot = S::TOKEN_EOT;
-        let tok_notimestamps = tokenizer.token_to_id("<|notimestamps|>").unwrap();
-        let prompt_len = prompt.len();
-        let suppressor = TokenSuppressor::new::<S>(
-            &tokenizer,
-            prompt_len,
-            options.notimestamps,
-            &options.suppress_tokens,
-        )?;
-        let suppress_fn = |gen_len: usize, logits: &mut [f32]| suppressor.apply(gen_len, logits);
-
-        let mut generated: Vec<u32>;
-
-        if options.beam_size > 1 {
-            let mut beam_search = BeamSearch::<S>::new(
-                options.beam_size,
-                state.clone(),
-                last_logits,
-                prompt.clone(),
-                0.6,
-            );
-            for _ in 0..options.max_new_tokens {
-                beam_search.step(decoder, &suppress_fn)?;
-                if beam_search.beams.is_empty() {
-                    break;
-                }
-            }
-            generated = beam_search.best_result().unwrap_or_default();
-        } else {
-            generated = Vec::new();
-            let mut current_logits = last_logits;
-
-            for _step in 0..options.max_new_tokens {
-                let mut logits_1d = current_logits.clone();
-                suppress_fn(prompt_len + generated.len(), &mut logits_1d);
-
-                let token_id = argmax_token(&logits_1d);
-                if token_id == tok_eot {
-                    break;
-                }
-
-                generated.push(token_id);
-
-                if generated.len() >= 8 {
-                    let tail = &generated[generated.len() - 8..];
-                    if tail[0..4] == tail[4..8] {
-                        break;
-                    }
-                }
-
-                current_logits = decoder
-                    .step(&mut state, token_id)
-                    .map_err(|e| anyhow!("decoder step failed on window {}: {e}", window.index))?;
-            }
-        }
-
-        // Filter out the prompt from the best result if using beam search
-        let output_tokens = if options.beam_size > 1 {
-            generated.get(prompt.len()..).unwrap_or(&[])
-        } else {
-            &generated
-        };
-
-        state.reset();
-        let window_text = tokenizer.decode(output_tokens, true).unwrap();
-        full_text.push_str(&window_text);
+        full_text.push_str(&result.text);
         full_text.push(' ');
-        segments.extend(tokens_to_segments(
-            &tokenizer,
-            output_tokens,
-            window.index,
-            samples_to_sec(window.start_sample),
-            samples_to_sec(window.end_sample),
-            tok_notimestamps + 1,
-        ));
+        segments.extend(result.segments);
     }
 
     Ok(Transcription {
         text: full_text.trim().to_string(),
         segments,
         vad_segments,
+    })
+}
+
+pub(crate) fn transcription_windows(
+    audio_len: usize,
+    vad_segments: &[VadSegment],
+) -> Vec<AudioWindow> {
+    if vad_segments.is_empty() {
+        fixed_audio_windows(audio_len)
+    } else {
+        vad_audio_windows(vad_segments)
+    }
+}
+
+pub(crate) fn transcribe_audio_window<S: WhisperSpec>(
+    audio: &[f32],
+    tokenizer: &Tokenizer,
+    mel_spec: &MelSpectrogram,
+    encoder: &WhisperEncoder<S>,
+    enc_kv: &EncKvModel<S>,
+    decoder: &mut WhisperDecoder<S>,
+    window: &AudioWindow,
+    options: &TranscribeOptions,
+) -> Result<WindowTranscription> {
+    let mut state = WhisperDecoderState::new::<S>();
+    let wave = &audio[window.start_sample..window.end_sample];
+    let mels = mel_spec.log_mel_spectrogram(wave)?;
+
+    let encoded = encoder
+        .encode(&mels)
+        .map_err(|e| anyhow!("encoder failed on window {}: {e}", window.index))?;
+
+    let (enc_k, enc_v) = enc_kv
+        .compute(&encoded)
+        .map_err(|e| anyhow!("enc-kv failed on window {}: {e}", window.index))?;
+
+    decoder.set_enc_kv(enc_k, enc_v);
+
+    let prompt = control_prompt(
+        tokenizer,
+        &options.lang,
+        &options.task,
+        options.notimestamps,
+    )?;
+
+    state.reset();
+    let mut last_logits = vec![0f32; S::VOCAB];
+    for (i, &id) in prompt.iter().enumerate() {
+        last_logits = decoder
+            .step(&mut state, id)
+            .map_err(|e| anyhow!("prime step {i} failed on window {}: {e}", window.index))?;
+    }
+
+    let tok_eot = S::TOKEN_EOT;
+    let tok_notimestamps = tokenizer.token_to_id("<|notimestamps|>").unwrap();
+    let prompt_len = prompt.len();
+    let suppressor = TokenSuppressor::new::<S>(
+        tokenizer,
+        prompt_len,
+        options.notimestamps,
+        &options.suppress_tokens,
+    )?;
+    let suppress_fn = |gen_len: usize, logits: &mut [f32]| suppressor.apply(gen_len, logits);
+
+    let mut generated: Vec<u32>;
+
+    if options.beam_size > 1 {
+        let mut beam_search = BeamSearch::<S>::new(
+            options.beam_size,
+            state.clone(),
+            last_logits,
+            prompt.clone(),
+            0.6,
+        );
+        for _ in 0..options.max_new_tokens {
+            beam_search.step(decoder, &suppress_fn)?;
+            if beam_search.beams.is_empty() {
+                break;
+            }
+        }
+        generated = beam_search.best_result().unwrap_or_default();
+    } else {
+        generated = Vec::new();
+        let mut current_logits = last_logits;
+
+        for _step in 0..options.max_new_tokens {
+            let mut logits_1d = current_logits.clone();
+            suppress_fn(prompt_len + generated.len(), &mut logits_1d);
+
+            let token_id = argmax_token(&logits_1d);
+            if token_id == tok_eot {
+                break;
+            }
+
+            generated.push(token_id);
+
+            if generated.len() >= 8 {
+                let tail = &generated[generated.len() - 8..];
+                if tail[0..4] == tail[4..8] {
+                    break;
+                }
+            }
+
+            current_logits = decoder
+                .step(&mut state, token_id)
+                .map_err(|e| anyhow!("decoder step failed on window {}: {e}", window.index))?;
+        }
+    }
+
+    let output_tokens = if options.beam_size > 1 {
+        generated.get(prompt.len()..).unwrap_or(&[])
+    } else {
+        &generated
+    };
+
+    state.reset();
+    let text = tokenizer.decode(output_tokens, true).unwrap();
+    let segments = tokens_to_segments(
+        tokenizer,
+        output_tokens,
+        window.index,
+        samples_to_sec(window.start_sample),
+        samples_to_sec(window.end_sample),
+        tok_notimestamps + 1,
+    );
+
+    Ok(WindowTranscription {
+        window_index: window.index,
+        text,
+        segments,
     })
 }
 

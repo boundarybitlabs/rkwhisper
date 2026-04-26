@@ -5,6 +5,7 @@ use rkwhisper::{
     MelSpectrogram,
     decoder::WhisperDecoder,
     encoder::{EncKvModel, WhisperEncoder},
+    parallel::{ParallelModelPaths, transcribe_file_parallel_with_options},
     spec::{
         WhisperBase, WhisperLargeV3Turbo, WhisperMedium, WhisperSmall, WhisperSpec, WhisperTiny,
     },
@@ -88,6 +89,10 @@ struct Args {
     #[arg(long, default_value = "default")]
     suppress_tokens: String,
 
+    /// Run 30-second windows across three RK3588 NPU cores using Tokio workers
+    #[arg(long)]
+    multi_npu: bool,
+
     /// Optional Silero-style VAD .rknn model
     #[arg(long)]
     vad_model: Option<PathBuf>,
@@ -129,7 +134,48 @@ fn main() -> Result<()> {
     }
 }
 
-fn run<S: WhisperSpec>(args: Args, lib: &Path) -> Result<()> {
+fn run<S: WhisperSpec + Send + 'static>(args: Args, lib: &Path) -> Result<()> {
+    let options = TranscribeOptions::new(
+        args.lang.clone(),
+        args.task.clone(),
+        args.notimestamps,
+        args.max_new_tokens,
+        args.beam_size,
+        SuppressTokens::parse(&args.suppress_tokens)?,
+    );
+
+    if args.multi_npu {
+        let vad = if let Some(path) = &args.vad_model {
+            let config = VadConfig {
+                threshold: args.vad_threshold,
+                min_speech_ms: args.vad_min_speech_ms,
+                min_silence_ms: args.vad_min_silence_ms,
+                speech_pad_ms: args.vad_speech_pad_ms,
+                window_samples: args.vad_window_samples,
+            };
+            Some(VadModel::new(
+                RKNN::new_with_library(lib, &mut std::fs::read(path)?, 0)?,
+                config,
+            ))
+        } else {
+            None
+        };
+        let model_paths = ParallelModelPaths::new(
+            args.mel_spec.clone(),
+            args.encoder.clone(),
+            args.enc_kv.clone(),
+            args.decoder.clone(),
+        );
+        let transcription = transcribe_file_parallel_with_options::<S>(
+            &args.wav.to_string_lossy(),
+            &args.tokenizer.to_string_lossy(),
+            &model_paths,
+            vad.as_ref(),
+            &options,
+        )?;
+        return print_transcription(transcription, &args.output);
+    }
+
     let encoder = WhisperEncoder::<S>::new(RKNN::new_with_library(
         lib,
         &mut std::fs::read(&args.encoder)?,
@@ -167,15 +213,6 @@ fn run<S: WhisperSpec>(args: Args, lib: &Path) -> Result<()> {
         None
     };
 
-    let options = TranscribeOptions::new(
-        args.lang.clone(),
-        args.task.clone(),
-        args.notimestamps,
-        args.max_new_tokens,
-        args.beam_size,
-        SuppressTokens::parse(&args.suppress_tokens)?,
-    );
-
     let transcription = transcribe_with_options(
         &args.wav.to_string_lossy(),
         &args.tokenizer.to_string_lossy(),
@@ -187,7 +224,14 @@ fn run<S: WhisperSpec>(args: Args, lib: &Path) -> Result<()> {
         &options,
     )?;
 
-    match args.output {
+    print_transcription(transcription, &args.output)
+}
+
+fn print_transcription(
+    transcription: rkwhisper::whisper::Transcription,
+    output: &OutputFormat,
+) -> Result<()> {
+    match output {
         OutputFormat::Text => println!("{}", transcription.text),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&transcription)?),
     }
