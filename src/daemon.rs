@@ -106,7 +106,10 @@ pub fn parse_config(contents: &str) -> Result<DaemonConfig> {
 
 pub fn read_request<R: Read>(reader: &mut R) -> Result<DaemonRequest> {
     let header = read_header(reader)?;
+    read_request_body(header, reader)
+}
 
+pub fn read_request_body<R: Read>(header: RequestHeader, reader: &mut R) -> Result<DaemonRequest> {
     if header.mode != "batch" && header.mode != "stream" {
         bail!("unsupported mode {:?}", header.mode);
     }
@@ -114,17 +117,30 @@ pub fn read_request<R: Read>(reader: &mut R) -> Result<DaemonRequest> {
         bail!("beam_size must be at least 1");
     }
 
+    let audio = read_pcm_frame(reader)?.ok_or_else(|| anyhow!("empty audio"))?;
+
+    Ok(DaemonRequest { header, audio })
+}
+
+pub fn read_pcm_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<f32>>> {
     let mut len_buf = [0u8; 4];
-    reader
-        .read_exact(&mut len_buf)
+    let n = reader
+        .read(&mut len_buf[..1])
         .context("failed to read PCM byte count")?;
+    if n == 0 {
+        return Ok(None);
+    }
+    reader
+        .read_exact(&mut len_buf[1..])
+        .context("failed to read PCM byte count")?;
+
     let pcm_len = i32::from_le_bytes(len_buf);
     if pcm_len < 0 {
         bail!("negative PCM byte count");
     }
     let pcm_len = pcm_len as usize;
     if pcm_len == 0 {
-        bail!("empty audio");
+        return Ok(None);
     }
     if pcm_len % 2 != 0 {
         bail!("PCM byte count must be even for s16le audio");
@@ -136,7 +152,7 @@ pub fn read_request<R: Read>(reader: &mut R) -> Result<DaemonRequest> {
         .context("failed to read PCM body")?;
     let audio = pcm_s16le_to_f32(&pcm)?;
 
-    Ok(DaemonRequest { header, audio })
+    Ok(Some(audio))
 }
 
 pub fn read_header<R: Read>(reader: &mut R) -> Result<RequestHeader> {
