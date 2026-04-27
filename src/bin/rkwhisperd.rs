@@ -17,10 +17,8 @@ use rkwhisper::{
     whisper::{TranscribeOptions, Transcription},
 };
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::fs;
 use std::io::{BufWriter, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -98,40 +96,7 @@ fn bind_socket(socket: &Path) -> Result<UnixListener> {
         .with_context(|| format!("failed to bind socket {}", socket.display()))?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o660))
         .with_context(|| format!("failed to chmod socket {}", socket.display()))?;
-    chown_socket(socket, "rkwhisper")
-        .with_context(|| format!("failed to chown socket {}", socket.display()))?;
     Ok(listener)
-}
-
-fn chown_socket(socket: &Path, group_name: &str) -> Result<()> {
-    let gid = group_id(group_name)?.with_context(|| format!("group {group_name:?} not found"))?;
-    let c_path = CString::new(socket.as_os_str().as_bytes())
-        .context("socket path contains an interior NUL byte")?;
-    let rc = unsafe { libc::chown(c_path.as_ptr(), 0, gid) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error()).context("chown root:rkwhisper failed");
-    }
-    Ok(())
-}
-
-fn group_id(name: &str) -> Result<Option<u32>> {
-    let groups = fs::read_to_string("/etc/group").context("failed to read /etc/group")?;
-    for line in groups.lines() {
-        let mut parts = line.split(':');
-        let Some(group_name) = parts.next() else {
-            continue;
-        };
-        if group_name != name {
-            continue;
-        }
-        let gid = parts
-            .nth(1)
-            .context("malformed group entry")?
-            .parse::<u32>()
-            .context("group gid is not a number")?;
-        return Ok(Some(gid));
-    }
-    Ok(None)
 }
 
 fn handle_connection(mut stream: UnixStream, pools: &mut DaemonPools, lib: &Path) -> Result<()> {
