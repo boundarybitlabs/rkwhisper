@@ -1,8 +1,8 @@
-# RK3588 RKNN Whisper pipeline - Tokio multi-NPU design
+# RK3588 RKNN Whisper pipeline - Tokio multi-NPU architecture
 
 ## Overview
 
-The RK3588 NPU exposes three independent cores. This design runs three
+The RK3588 NPU exposes three independent cores. The current implementation runs three
 independent Whisper pipelines in parallel, with one long-lived worker per NPU
 core. Tokio coordinates input windows, worker readiness, backpressure, result
 collection, and shutdown; RKNN inference itself remains synchronous and
@@ -14,7 +14,8 @@ one core:
 - mel spectrogram
 - encoder
 - encoder-KV
-- decoder RKNN handle plus `WhisperDecoder`
+- decoder RKNN handle, with a short-lived `WhisperDecoder` constructed per
+  window
 
 Do not share RKNN contexts with `Arc<Mutex<_>>`. The current `rknpu2::RKNN`
 handle is a thin wrapper around an RKNN context and should be treated as
@@ -25,9 +26,13 @@ same worker thread that created and pinned the contexts.
 
 ## Pipeline stages
 
-VAD runs before fanout because it determines the audio windows. Once windows
-exist, each window is independent and can be processed by any available NPU
-worker.
+For batch transcription, VAD runs before fanout when a VAD model is configured
+because it determines the audio windows. If VAD is not configured, the
+coordinator builds fixed 30-second windows. Once windows exist, each window is
+independent and can be processed by any available NPU worker.
+
+For live daemon streams, incoming s16le PCM frames are buffered into 30-second
+windows and a final shorter window is dispatched when the stream closes.
 
 | Stage | Owner | Description |
 |---|---|---|
@@ -46,7 +51,7 @@ announces readiness first.
 
 ## Core masks
 
-For RK3588, start exactly three workers:
+For RK3588, the implemented pool starts exactly three workers:
 
 ```rust
 const NPU_WORKERS: usize = 3;
@@ -84,29 +89,22 @@ cores and prevents concurrent per-window scheduling.
 ## Worker-owned pipeline context
 
 Wrap the existing model wrappers in a worker-local context. The exact model spec
-remains generic over `WhisperSpec`.
+remains generic over `WhisperSpec`. The current implementation stores the
+decoder RKNN handle in the context and constructs a short-lived
+`WhisperDecoder` for each window.
 
 ```rust
 struct PipelineCtx<S: WhisperSpec> {
-    core_id: usize,
     mel_spec: MelSpectrogram,
     encoder: WhisperEncoder<S>,
     enc_kv: EncKvModel<S>,
     decoder_rknn: RKNN<RuntimeAPI>,
-    decoder: WhisperDecoder<'static, S>,
 }
 ```
 
-In real code, avoid forcing a fake `'static` lifetime. Prefer one of these
-shapes:
-
-- make `WhisperDecoder<S>` own its `RKNN<RuntimeAPI>` instead of borrowing it, or
-- store `decoder_rknn` and construct a short-lived `WhisperDecoder` inside
-  `transcribe_window`.
-
-`PipelineCtx::transcribe_window(...)` should contain the current per-window body
-from `transcribe_audio_with_options`: log-mel, encode, enc-KV, prompt, greedy or
-beam decode, token decode, and `TranscriptSegment` construction.
+`PipelineCtx::transcribe_window(...)` delegates to the shared per-window body:
+log-mel, encode, enc-KV, prompt, greedy or beam decode, token decode, and
+`TranscriptSegment` construction.
 
 ---
 
@@ -117,8 +115,8 @@ Tokio owns the control plane:
 - one bounded job channel per worker
 - one shared ready channel
 - one shared result channel
-- one dispatcher task
-- one collector/reorder task
+- one dispatcher future
+- one collector/reorder future
 
 The workers themselves run on dedicated OS threads. Do not use Tokio's general
 worker pool for RKNN inference, because the model contexts must remain attached
@@ -126,8 +124,10 @@ to their owning thread and NPU core.
 
 ```rust
 struct Job {
-    window: AudioWindow,
-    audio: Arc<[f32]>,
+    window_index: usize,
+    start_sample: usize,
+    end_sample: usize,
+    samples: Arc<[f32]>,
     tokenizer: Arc<Tokenizer>,
     options: Arc<TranscribeOptions>,
 }
@@ -136,7 +136,7 @@ struct Ready {
     worker_id: usize,
 }
 
-struct WindowResult {
+struct WindowTranscription {
     window_index: usize,
     text: String,
     segments: Vec<TranscriptSegment>,
@@ -149,16 +149,17 @@ Worker startup:
 fn spawn_npu_worker<S: WhisperSpec + Send + 'static>(
     worker_id: usize,
     core_mask: u32,
+    lib: PathBuf,
     model_bytes: Arc<ModelBytes>,
     ready_tx: tokio::sync::mpsc::Sender<Ready>,
-    result_tx: tokio::sync::mpsc::Sender<anyhow::Result<WindowResult>>,
-) -> tokio::sync::mpsc::Sender<Job> {
+    result_tx: tokio::sync::mpsc::Sender<anyhow::Result<WindowTranscription>>,
+) -> anyhow::Result<Worker> {
     let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<Job>(1);
 
-    std::thread::Builder::new()
+    let join = std::thread::Builder::new()
         .name(format!("rkwhisper-npu-{worker_id}"))
         .spawn(move || {
-            let mut ctx = PipelineCtx::<S>::load(model_bytes, core_mask, worker_id)?;
+            let ctx = PipelineCtx::<S>::load(&lib, &model_bytes, core_mask)?;
 
             ready_tx.blocking_send(Ready { worker_id })?;
 
@@ -170,9 +171,12 @@ fn spawn_npu_worker<S: WhisperSpec + Send + 'static>(
 
             anyhow::Ok(())
         })
-        .expect("failed to spawn NPU worker");
+        .context("failed to spawn NPU worker")?;
 
-    job_tx
+    Ok(Worker {
+        job_tx,
+        join: Some(join),
+    })
 }
 ```
 
@@ -190,7 +194,7 @@ next ready worker.
 async fn dispatch_windows(
     windows: Vec<AudioWindow>,
     worker_txs: Vec<tokio::sync::mpsc::Sender<Job>>,
-    mut ready_rx: tokio::sync::mpsc::Receiver<Ready>,
+    ready_rx: &mut tokio::sync::mpsc::Receiver<Ready>,
     audio: Arc<[f32]>,
     tokenizer: Arc<Tokenizer>,
     options: Arc<TranscribeOptions>,
@@ -201,14 +205,18 @@ async fn dispatch_windows(
         let ready = ready_rx.recv().await
             .ok_or_else(|| anyhow::anyhow!("all NPU workers stopped"))?;
 
-        let job = Job {
-            window,
-            audio: audio.clone(),
-            tokenizer: tokenizer.clone(),
-            options: options.clone(),
-        };
-
-        worker_txs[ready.worker_id].send(job).await?;
+        worker_txs[ready.worker_id]
+            .send(Job {
+                window_index: window.index,
+                start_sample: window.start_sample,
+                end_sample: window.end_sample,
+                samples: Arc::<[f32]>::from(
+                    audio[window.start_sample..window.end_sample].to_vec(),
+                ),
+                tokenizer: tokenizer.clone(),
+                options: options.clone(),
+            })
+            .await?;
     }
 
     Ok(())
@@ -228,10 +236,11 @@ only when the next expected index is available.
 
 ```rust
 async fn collect_ordered(
-    mut result_rx: tokio::sync::mpsc::Receiver<anyhow::Result<WindowResult>>,
+    result_rx: &mut tokio::sync::mpsc::Receiver<anyhow::Result<WindowTranscription>>,
     total_windows: usize,
+    vad_segments: Vec<VadSegment>,
 ) -> anyhow::Result<Transcription> {
-    let mut pending = std::collections::BTreeMap::<usize, WindowResult>::new();
+    let mut pending = std::collections::BTreeMap::<usize, WindowTranscription>::new();
     let mut next = 0usize;
     let mut full_text = String::new();
     let mut segments = Vec::new();
@@ -252,13 +261,13 @@ async fn collect_ordered(
     Ok(Transcription {
         text: full_text.trim().to_string(),
         segments,
-        vad_segments: Vec::new(),
+        vad_segments,
     })
 }
 ```
 
-When VAD is enabled, carry the precomputed `vad_segments` outside this collector
-and attach them to the final `Transcription`.
+When VAD is enabled, the collector carries the precomputed `vad_segments` and
+attaches them to the final `Transcription`.
 
 ---
 
@@ -268,23 +277,22 @@ Dropping all worker job senders closes the worker channels. Each worker finishes
 its current window, exits its receive loop, and drops RKNN contexts on the same
 thread that created them.
 
-If any worker returns an error, the coordinator should:
+If a worker returns an error for a window, the worker attaches its worker ID and
+window index to the error context and sends that error on the shared result
+channel. The collector returns the first error it receives. The long-lived pool
+remains available unless a worker channel closes or a worker thread exits.
 
-1. drop all job senders to stop future work;
-2. drain or close the result channel;
-3. return the first error with the worker ID and window index attached.
-
-For daemon use, keep workers alive across requests only when the model is fixed.
-If requests can select different models, use a pool key of `(model_id,
-model_kind)` and create one three-worker pool per loaded model, or keep the v1
-daemon request-scoped and accept model reload cost.
+For daemon use, workers are kept alive across requests. `rkwhisperd` loads one
+three-worker pool per enabled model at startup and selects the pool by request
+model id.
 
 ---
 
 ## Optional CPU affinity
 
 NPU core masks do not pin the CPU thread. For lower latency jitter, optionally
-pin each worker thread to a big CPU core before loading RKNN contexts:
+pin each worker thread to a big CPU core before loading RKNN contexts. This is
+not currently wired into `Cargo.toml`.
 
 ```rust
 core_affinity::set_for_current(core_affinity::CoreId { id: 4 + worker_id });
@@ -299,9 +307,8 @@ worker is processing a window.
 
 ```toml
 [dependencies]
-anyhow = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
-core_affinity = "0.8" # optional
+anyhow = { version = "1", features = ["backtrace"] }
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
 ```
 
 Tokio is not used to run RKNN calls concurrently on the same context. Its role is
@@ -310,12 +317,9 @@ assembly.
 
 ---
 
-## Test plan
+## Tests and remaining verification
 
-- Unit-test the dispatcher with fake workers that complete windows out of order.
-- Unit-test result reordering for already-ordered, reversed, and delayed
-  results.
-- Unit-test bounded worker queues so each worker has at most one queued job.
+- Unit tests cover result reordering and early-close error reporting.
 - Integration-test on RK3588 with long audio:
   - all three workers initialize;
   - each worker reports a distinct core mask;

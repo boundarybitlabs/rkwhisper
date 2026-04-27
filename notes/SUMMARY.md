@@ -3,46 +3,82 @@
 `rkwhisper` is a Rust implementation of a Whisper transcription pipeline for
 Rockchip RKNN/NPU models. It loads separate RKNN models for mel spectrogram
 generation, the Whisper encoder, encoder cross-attention key/value generation,
-and autoregressive decoder steps, then runs transcription over 30-second WAV
-chunks.
+and autoregressive decoder steps, then runs transcription over fixed or
+VAD-derived audio windows up to 30 seconds long.
 
 ## Crate Shape
 
-- `Cargo.toml` defines a Rust 2024 crate with a library and CLI binary.
+- `Cargo.toml` defines a Rust 2024 crate with a library, CLI binary, and Unix
+  socket daemon binary.
 - `src/lib.rs` exposes the core modules and shared Whisper audio constants.
 - `src/bin/rkwhisper.rs` is the command-line entry point.
+- `src/bin/rkwhisperd.rs` is the long-running Unix socket daemon.
+- `src/daemon.rs` defines daemon config loading, model-file resolution,
+  request framing, PCM conversion, and response serialization.
+- `src/parallel.rs` owns the three-worker multi-NPU pipeline used by
+  `--multi-npu` and by daemon model pools.
 - The crate depends on `rknpu2` for RKNN runtime access, `tokenizers` for
-  Whisper tokenization, `hound` for WAV loading, and `clap` for CLI parsing.
+  Whisper tokenization, `hound` for WAV loading, `tokio` for worker
+  coordination channels/runtime, `toml` for daemon config, and `clap` for CLI
+  parsing.
 
 ## Runtime Pipeline
 
 The CLI accepts:
 
-- model family: `small`, `medium`, or `large-v3-turbo`
+- model family: `tiny`, `base`, `small`, `medium`, or `large-v3-turbo`
 - tokenizer path
 - RKNN model paths for mel spectrogram, encoder, encoder-KV, and decoder
 - input mono 16 kHz WAV file
 - language/task options
 - decoding controls such as `max_new_tokens`, `beam_size`, and timestamp
   suppression
+- output format: text or JSON
+- token suppression mode: default, none, or explicit token IDs
+- optional VAD model/configuration
+- optional `--multi-npu` execution across three NPU workers
 
 At runtime, `src/bin/rkwhisper.rs`:
 
 1. Finds the RKNN runtime library with `rknpu2::utils::find_rknn_library`.
 2. Loads each `.rknn` model into an `RKNN<RuntimeAPI>` context.
 3. Selects the model specification type from `src/spec.rs`.
-4. Calls `whisper::transcribe`.
+4. Calls either the serial `whisper::transcribe_with_options` path or the
+   multi-NPU `parallel::transcribe_file_parallel_with_options` path.
 
-`whisper::transcribe` then processes the audio in `N_SAMPLES` chunks, where
-`N_SAMPLES` is 30 seconds at 16 kHz:
+The serial `whisper` path processes audio in fixed 30-second windows unless a
+VAD model is provided. With VAD, speech segments are split into windows no
+longer than `N_SAMPLES`, where `N_SAMPLES` is 30 seconds at 16 kHz:
 
 1. Load and validate WAV input.
-2. Generate log-mel features with the mel RKNN model.
-3. Run the encoder RKNN model.
-4. Run the encoder-KV RKNN model to compute per-layer cross-attention K/V.
-5. Prime the decoder with Whisper control tokens.
-6. Generate tokens using greedy decoding or beam search.
-7. Decode generated token IDs back to text and concatenate chunk outputs.
+2. Optionally run VAD and derive speech windows.
+3. Generate log-mel features with the mel RKNN model.
+4. Run the encoder RKNN model.
+5. Run the encoder-KV RKNN model to compute per-layer cross-attention K/V.
+6. Prime the decoder with Whisper control tokens.
+7. Generate tokens using greedy decoding or beam search.
+8. Decode generated token IDs back to text and timestamped segments.
+9. Concatenate ordered window outputs.
+
+The multi-NPU path loads one full RKNN context set per worker, pins each worker
+to a distinct RK3588 NPU core mask, dynamically dispatches ready workers to
+pending windows, and reorders results by window index.
+
+## Daemon Runtime
+
+`src/bin/rkwhisperd.rs` runs a Unix socket ASR daemon. It:
+
+1. Loads `/etc/rkwhisper.toml` by default, or a path supplied with `--config`.
+2. Resolves enabled model directories under `RKWHISPER_MODEL_ROOT` or
+   `/usr/share/rkwhisper`.
+3. Creates one persistent `ParallelTranscriberPool` per enabled model.
+4. Accepts newline-terminated JSON request headers followed by framed s16le PCM.
+5. Supports batch requests and live streaming requests.
+6. Emits newline-delimited JSON `segment`, `done`, or `error` responses.
+
+Each configured model directory must contain `tokenizer.json`, `mel.rknn`,
+`encoder.rknn`, `enc_kv.rknn`, and `decoder.rknn`. If `vad.rknn` is present,
+batch requests can use it for VAD-derived windows.
 
 ## Audio and Mel Frontend
 
@@ -80,6 +116,8 @@ dimensions used throughout the encoder, decoder, KV cache, and logits buffers:
 
 Implemented specs:
 
+- `WhisperTiny`
+- `WhisperBase`
 - `WhisperSmall`
 - `WhisperMedium`
 - `WhisperLargeV3Turbo`
@@ -209,7 +247,7 @@ not wired into the active pipeline.
 
 ## Tests
 
-The visible tests are in `src/cache.rs`. They validate:
+The test suite covers:
 
 - packed cache length and layout
 - base offset math
@@ -218,22 +256,29 @@ The visible tests are in `src/cache.rs`. They validate:
 - left compaction
 - slice views
 - fill/compact/append behavior
+- daemon request framing, PCM conversion, config parsing, and model resolution
+- suppression mode parsing
+- VAD segment merging, padding, and short-speech filtering
+- fixed and VAD-derived transcription windowing
+- timestamp token conversion
+- parallel result reordering and early-close error reporting
 
 Most of the active RKNN pipeline is integration-oriented and depends on actual
 RKNN model files, tokenizer files, and Rockchip runtime availability.
 
 ## Design Note
 
-`MULTI_THREADED_PIPELINE.md` describes a planned or reference design for
-parallelizing Whisper windows across the three RK3588 NPU cores using a fixed
-Rayon thread pool, thread-local RKNN contexts, core masks, work stealing, and
-result reordering. That design is not currently implemented in the crate's
-compiled source; the current CLI runs one pipeline instance directly.
+`MULTI_THREADED_PIPELINE.md` describes the implemented Tokio-coordinated
+multi-NPU pipeline. The CLI can opt into it with `--multi-npu`, while the daemon
+uses persistent multi-NPU pools for all configured models.
 
 ## Important Operational Assumptions
 
 - Input audio must be mono, 16 kHz WAV.
-- Each chunk is processed as a 30-second window.
+- Serial and parallel batch modes process fixed 30-second windows unless VAD
+  produces speech-derived windows.
+- Live daemon stream mode buffers incoming s16le PCM into 30-second windows and
+  dispatches a final shorter window at end-of-stream.
 - RKNN model I/O tensor layouts must match the documented assumptions in
   `encoder.rs` and `decoder.rs`.
 - The tokenizer must contain Whisper special tokens such as

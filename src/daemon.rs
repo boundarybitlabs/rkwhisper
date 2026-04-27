@@ -9,7 +9,7 @@ use std::time::Duration;
 
 pub const DEFAULT_MODEL_ROOT: &str = "/usr/share/rkwhisper";
 pub const MODEL_ROOT_ENV: &str = "RKWHISPER_MODEL_ROOT";
-pub const DEFAULT_SOCKET_PATH: &str = "/var/rkwhisper/asr.sock";
+pub const DEFAULT_SOCKET_PATH: &str = "/run/rkwhisper/asr.sock";
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/rkwhisper.toml";
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 
