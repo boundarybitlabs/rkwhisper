@@ -566,7 +566,9 @@ mod tests {
 
     #[tokio::test]
     async fn collect_ordered_reports_early_close() {
-        let (_tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+
         let mut rx = rx;
         let error = collect_ordered_with_callback(&mut rx, 1, Vec::new(), |_| Ok(()))
             .await
