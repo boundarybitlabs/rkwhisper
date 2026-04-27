@@ -2,12 +2,13 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use rknpu2::{RKNN, utils::find_rknn_library};
 use rkwhisper::{
+    N_SAMPLES,
     daemon::{
         DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH, DaemonConfig, DaemonRequest, DaemonResponse,
-        ModelFiles, ModelKind, default_model_root, load_config, resolve_enabled_model_files,
-        response_line,
+        ModelFiles, ModelKind, RequestHeader, default_model_root, load_config, read_pcm_frame,
+        read_request_body, resolve_enabled_model_files, response_line,
     },
-    parallel::{ParallelModelPaths, ParallelTranscriberPool},
+    parallel::{LiveTranscriptionStats, LiveWindow, ParallelModelPaths, ParallelTranscriberPool},
     spec::{
         WhisperBase, WhisperLargeV3Turbo, WhisperMedium, WhisperSmall, WhisperSpec, WhisperTiny,
     },
@@ -26,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokenizers::Tokenizer;
+use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "RKWhisper Unix socket ASR daemon")]
@@ -133,7 +135,19 @@ fn group_id(name: &str) -> Result<Option<u32>> {
 }
 
 fn handle_connection(mut stream: UnixStream, pools: &mut DaemonPools, lib: &Path) -> Result<()> {
-    let request = match rkwhisper::daemon::read_request(&mut stream) {
+    let header = match rkwhisper::daemon::read_header(&mut stream) {
+        Ok(request) => request,
+        Err(error) => {
+            write_error(&mut stream, &error.to_string())?;
+            return Ok(());
+        }
+    };
+
+    if header.mode == "stream" {
+        return handle_stream_connection(stream, pools, lib, header);
+    }
+
+    let request = match read_request_body(header, &mut stream) {
         Ok(request) => request,
         Err(error) => {
             write_error(&mut stream, &error.to_string())?;
@@ -145,17 +159,36 @@ fn handle_connection(mut stream: UnixStream, pools: &mut DaemonPools, lib: &Path
     let started = Instant::now();
     let audio_s = rkwhisper::daemon::audio_seconds(request.audio.len());
 
-    match pools.transcribe_request(lib, &request) {
+    let result = if request.header.mode == "stream" {
+        pools.transcribe_request_streaming(lib, &request, |segment| {
+            writer.write_all(
+                response_line(&DaemonResponse::Segment {
+                    text: &segment.text,
+                    begin: segment.start_sec,
+                    end: segment.end_sec,
+                })?
+                .as_bytes(),
+            )?;
+            writer.flush()?;
+            Ok(())
+        })
+    } else {
+        pools.transcribe_request(lib, &request)
+    };
+
+    match result {
         Ok(transcription) => {
-            for segment in &transcription.segments {
-                writer.write_all(
-                    response_line(&DaemonResponse::Segment {
-                        text: &segment.text,
-                        begin: segment.start_sec,
-                        end: segment.end_sec,
-                    })?
-                    .as_bytes(),
-                )?;
+            if request.header.mode == "batch" {
+                for segment in &transcription.segments {
+                    writer.write_all(
+                        response_line(&DaemonResponse::Segment {
+                            text: &segment.text,
+                            begin: segment.start_sec,
+                            end: segment.end_sec,
+                        })?
+                        .as_bytes(),
+                    )?;
+                }
             }
             writer.write_all(
                 response_line(&DaemonResponse::Done {
@@ -176,6 +209,161 @@ fn handle_connection(mut stream: UnixStream, pools: &mut DaemonPools, lib: &Path
     }
 
     writer.flush()?;
+    Ok(())
+}
+
+fn handle_stream_connection(
+    mut stream: UnixStream,
+    pools: &mut DaemonPools,
+    lib: &Path,
+    header: RequestHeader,
+) -> Result<()> {
+    if header.beam_size == 0 {
+        write_error(&mut stream, "beam_size must be at least 1")?;
+        return Ok(());
+    }
+
+    let reader = stream
+        .try_clone()
+        .context("failed to clone stream for live reader")?;
+    let mut writer = BufWriter::new(stream);
+    let started = Instant::now();
+    let (window_tx, window_rx) = mpsc::channel::<Result<LiveWindow>>(4);
+
+    let reader = std::thread::Builder::new()
+        .name("rkwhisper-live-reader".to_string())
+        .spawn(move || read_live_windows(reader, window_tx))
+        .context("failed to spawn live stream reader")?;
+
+    let result = pools.transcribe_live_stream(lib, &header, window_rx, |segment| {
+        writer.write_all(
+            response_line(&DaemonResponse::Segment {
+                text: &segment.text,
+                begin: segment.start_sec,
+                end: segment.end_sec,
+            })?
+            .as_bytes(),
+        )?;
+        writer.flush()?;
+        Ok(())
+    });
+
+    let (total_samples, total_windows) = match reader.join() {
+        Ok(Ok(stats)) => stats,
+        Ok(Err(error)) => {
+            writer.write_all(
+                response_line(&DaemonResponse::Error {
+                    error: &error.to_string(),
+                })?
+                .as_bytes(),
+            )?;
+            writer.flush()?;
+            return Ok(());
+        }
+        Err(_) => {
+            writer.write_all(
+                response_line(&DaemonResponse::Error {
+                    error: "live stream reader thread panicked",
+                })?
+                .as_bytes(),
+            )?;
+            writer.flush()?;
+            return Ok(());
+        }
+    };
+
+    match result {
+        Ok((_transcription, stats)) => {
+            eprintln!(
+                "stream completed: produced={} dispatched={} completed={}",
+                total_windows, stats.windows_dispatched, stats.windows_completed
+            );
+            writer.write_all(
+                response_line(&DaemonResponse::Done {
+                    audio_s: rkwhisper::daemon::audio_seconds(total_samples),
+                    rtf: rkwhisper::daemon::real_time_factor(
+                        started.elapsed(),
+                        rkwhisper::daemon::audio_seconds(total_samples),
+                    ),
+                })?
+                .as_bytes(),
+            )?
+        }
+        Err(error) => writer.write_all(
+            response_line(&DaemonResponse::Error {
+                error: &error.to_string(),
+            })?
+            .as_bytes(),
+        )?,
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn read_live_windows(
+    mut stream: UnixStream,
+    window_tx: mpsc::Sender<Result<LiveWindow>>,
+) -> Result<(usize, usize)> {
+    let mut buffer = Vec::<f32>::new();
+    let mut total_samples = 0usize;
+    let mut total_windows = 0usize;
+    let mut next_window_index = 0usize;
+    let mut next_window_start = 0usize;
+
+    loop {
+        let frame = read_pcm_frame(&mut stream);
+        match frame {
+            Ok(Some(samples)) => {
+                total_samples += samples.len();
+                buffer.extend(samples);
+            }
+            Ok(None) => {
+                if !buffer.is_empty() {
+                    send_live_window(
+                        &window_tx,
+                        next_window_index,
+                        next_window_start,
+                        std::mem::take(&mut buffer),
+                    )?;
+                    total_windows += 1;
+                }
+                break;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let _ = window_tx.blocking_send(Err(error));
+                bail!("{message}");
+            }
+        }
+
+        while buffer.len() >= N_SAMPLES {
+            let samples = buffer.drain(..N_SAMPLES).collect::<Vec<_>>();
+            send_live_window(&window_tx, next_window_index, next_window_start, samples)?;
+            total_windows += 1;
+            next_window_index += 1;
+            next_window_start += N_SAMPLES;
+        }
+    }
+
+    Ok((total_samples, total_windows))
+}
+
+fn send_live_window(
+    window_tx: &mpsc::Sender<Result<LiveWindow>>,
+    index: usize,
+    start_sample: usize,
+    samples: Vec<f32>,
+) -> Result<()> {
+    let end_sample = start_sample + samples.len();
+    window_tx
+        .blocking_send(Ok(LiveWindow {
+            index,
+            start_sample,
+            end_sample,
+            samples,
+        }))
+        .map_err(|_| anyhow::anyhow!("live stream worker stopped"))?;
     Ok(())
 }
 
@@ -213,6 +401,39 @@ impl DaemonPools {
             .ok_or_else(|| anyhow::anyhow!("model not found"))?;
         pool.transcribe(lib, request)
     }
+
+    fn transcribe_request_streaming<F>(
+        &mut self,
+        lib: &Path,
+        request: &DaemonRequest,
+        on_segment: F,
+    ) -> Result<Transcription>
+    where
+        F: FnMut(&rkwhisper::whisper::TranscriptSegment) -> Result<()>,
+    {
+        let pool = self
+            .pools
+            .get_mut(&request.header.model)
+            .ok_or_else(|| anyhow::anyhow!("model not found"))?;
+        pool.transcribe_streaming(lib, request, on_segment)
+    }
+
+    fn transcribe_live_stream<F>(
+        &mut self,
+        lib: &Path,
+        header: &RequestHeader,
+        window_rx: mpsc::Receiver<Result<LiveWindow>>,
+        on_segment: F,
+    ) -> Result<(Transcription, LiveTranscriptionStats)>
+    where
+        F: FnMut(&rkwhisper::whisper::TranscriptSegment) -> Result<()>,
+    {
+        let pool = self
+            .pools
+            .get_mut(&header.model)
+            .ok_or_else(|| anyhow::anyhow!("model not found"))?;
+        pool.transcribe_live_stream(lib, header, window_rx, on_segment)
+    }
 }
 
 enum ModelPool {
@@ -249,6 +470,45 @@ impl ModelPool {
             Self::LargeV3Turbo(pool) => pool.transcribe(lib, request),
         }
     }
+
+    fn transcribe_streaming<F>(
+        &mut self,
+        lib: &Path,
+        request: &DaemonRequest,
+        on_segment: F,
+    ) -> Result<Transcription>
+    where
+        F: FnMut(&rkwhisper::whisper::TranscriptSegment) -> Result<()>,
+    {
+        match self {
+            Self::Tiny(pool) => pool.transcribe_streaming(lib, request, on_segment),
+            Self::Base(pool) => pool.transcribe_streaming(lib, request, on_segment),
+            Self::Small(pool) => pool.transcribe_streaming(lib, request, on_segment),
+            Self::Medium(pool) => pool.transcribe_streaming(lib, request, on_segment),
+            Self::LargeV3Turbo(pool) => pool.transcribe_streaming(lib, request, on_segment),
+        }
+    }
+
+    fn transcribe_live_stream<F>(
+        &mut self,
+        lib: &Path,
+        header: &RequestHeader,
+        window_rx: mpsc::Receiver<Result<LiveWindow>>,
+        on_segment: F,
+    ) -> Result<(Transcription, LiveTranscriptionStats)>
+    where
+        F: FnMut(&rkwhisper::whisper::TranscriptSegment) -> Result<()>,
+    {
+        match self {
+            Self::Tiny(pool) => pool.transcribe_live_stream(lib, header, window_rx, on_segment),
+            Self::Base(pool) => pool.transcribe_live_stream(lib, header, window_rx, on_segment),
+            Self::Small(pool) => pool.transcribe_live_stream(lib, header, window_rx, on_segment),
+            Self::Medium(pool) => pool.transcribe_live_stream(lib, header, window_rx, on_segment),
+            Self::LargeV3Turbo(pool) => {
+                pool.transcribe_live_stream(lib, header, window_rx, on_segment)
+            }
+        }
+    }
 }
 
 struct TypedModelPool<S: WhisperSpec + Send + 'static> {
@@ -276,6 +536,61 @@ impl<S: WhisperSpec + Send + 'static> TypedModelPool<S> {
     }
 
     fn transcribe(&mut self, lib: &Path, request: &DaemonRequest) -> Result<Transcription> {
+        self.transcribe_inner(
+            lib,
+            request,
+            None::<fn(&rkwhisper::whisper::TranscriptSegment) -> Result<()>>,
+        )
+    }
+
+    fn transcribe_streaming<F>(
+        &mut self,
+        lib: &Path,
+        request: &DaemonRequest,
+        on_segment: F,
+    ) -> Result<Transcription>
+    where
+        F: FnMut(&rkwhisper::whisper::TranscriptSegment) -> Result<()>,
+    {
+        self.transcribe_inner(lib, request, Some(on_segment))
+    }
+
+    fn transcribe_live_stream<F>(
+        &mut self,
+        _lib: &Path,
+        header: &RequestHeader,
+        window_rx: mpsc::Receiver<Result<LiveWindow>>,
+        on_segment: F,
+    ) -> Result<(Transcription, LiveTranscriptionStats)>
+    where
+        F: FnMut(&rkwhisper::whisper::TranscriptSegment) -> Result<()>,
+    {
+        let options = TranscribeOptions::new(
+            header.lang.clone(),
+            header.task.clone(),
+            header.notimestamps,
+            header.max_new_tokens,
+            header.beam_size,
+            SuppressTokens::parse(&header.suppress_tokens)?,
+        );
+
+        self.pool.transcribe_live_windows_with_callback(
+            window_rx,
+            self.tokenizer.clone(),
+            &options,
+            on_segment,
+        )
+    }
+
+    fn transcribe_inner<F>(
+        &mut self,
+        lib: &Path,
+        request: &DaemonRequest,
+        on_segment: Option<F>,
+    ) -> Result<Transcription>
+    where
+        F: FnMut(&rkwhisper::whisper::TranscriptSegment) -> Result<()>,
+    {
         let vad = if let Some(path) = &self.files.vad {
             let config = vad_config_from_request(request);
             Some(VadModel::new(
@@ -295,12 +610,22 @@ impl<S: WhisperSpec + Send + 'static> TypedModelPool<S> {
             SuppressTokens::parse(&request.header.suppress_tokens)?,
         );
 
-        self.pool.transcribe_audio_with_options(
-            &request.audio,
-            self.tokenizer.clone(),
-            vad.as_ref(),
-            &options,
-        )
+        if let Some(on_segment) = on_segment {
+            self.pool.transcribe_audio_with_segment_callback(
+                &request.audio,
+                self.tokenizer.clone(),
+                vad.as_ref(),
+                &options,
+                on_segment,
+            )
+        } else {
+            self.pool.transcribe_audio_with_options(
+                &request.audio,
+                self.tokenizer.clone(),
+                vad.as_ref(),
+                &options,
+            )
+        }
     }
 }
 

@@ -183,17 +183,43 @@ pub(crate) fn transcribe_audio_window<S: WhisperSpec>(
     window: &AudioWindow,
     options: &TranscribeOptions,
 ) -> Result<WindowTranscription> {
-    let mut state = WhisperDecoderState::new::<S>();
     let wave = &audio[window.start_sample..window.end_sample];
+    transcribe_window_samples(
+        wave,
+        tokenizer,
+        mel_spec,
+        encoder,
+        enc_kv,
+        decoder,
+        window.index,
+        window.start_sample,
+        window.end_sample,
+        options,
+    )
+}
+
+pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
+    wave: &[f32],
+    tokenizer: &Tokenizer,
+    mel_spec: &MelSpectrogram,
+    encoder: &WhisperEncoder<S>,
+    enc_kv: &EncKvModel<S>,
+    decoder: &mut WhisperDecoder<S>,
+    window_index: usize,
+    window_start_sample: usize,
+    window_end_sample: usize,
+    options: &TranscribeOptions,
+) -> Result<WindowTranscription> {
+    let mut state = WhisperDecoderState::new::<S>();
     let mels = mel_spec.log_mel_spectrogram(wave)?;
 
     let encoded = encoder
         .encode(&mels)
-        .map_err(|e| anyhow!("encoder failed on window {}: {e}", window.index))?;
+        .map_err(|e| anyhow!("encoder failed on window {window_index}: {e}"))?;
 
     let (enc_k, enc_v) = enc_kv
         .compute(&encoded)
-        .map_err(|e| anyhow!("enc-kv failed on window {}: {e}", window.index))?;
+        .map_err(|e| anyhow!("enc-kv failed on window {window_index}: {e}"))?;
 
     decoder.set_enc_kv(enc_k, enc_v);
 
@@ -209,7 +235,7 @@ pub(crate) fn transcribe_audio_window<S: WhisperSpec>(
     for (i, &id) in prompt.iter().enumerate() {
         last_logits = decoder
             .step(&mut state, id)
-            .map_err(|e| anyhow!("prime step {i} failed on window {}: {e}", window.index))?;
+            .map_err(|e| anyhow!("prime step {i} failed on window {window_index}: {e}"))?;
     }
 
     let tok_eot = S::TOKEN_EOT;
@@ -264,7 +290,7 @@ pub(crate) fn transcribe_audio_window<S: WhisperSpec>(
 
             current_logits = decoder
                 .step(&mut state, token_id)
-                .map_err(|e| anyhow!("decoder step failed on window {}: {e}", window.index))?;
+                .map_err(|e| anyhow!("decoder step failed on window {window_index}: {e}"))?;
         }
     }
 
@@ -279,14 +305,14 @@ pub(crate) fn transcribe_audio_window<S: WhisperSpec>(
     let segments = tokens_to_segments(
         tokenizer,
         output_tokens,
-        window.index,
-        samples_to_sec(window.start_sample),
-        samples_to_sec(window.end_sample),
+        window_index,
+        samples_to_sec(window_start_sample),
+        samples_to_sec(window_end_sample),
         tok_notimestamps + 1,
     );
 
     Ok(WindowTranscription {
-        window_index: window.index,
+        window_index,
         text,
         segments,
     })

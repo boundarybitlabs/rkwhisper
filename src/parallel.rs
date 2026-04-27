@@ -3,8 +3,8 @@ use crate::encoder::{EncKvModel, WhisperEncoder};
 use crate::spec::WhisperSpec;
 use crate::vad::VadModel;
 use crate::whisper::{
-    AudioWindow, TranscribeOptions, Transcription, WindowTranscription, transcribe_audio_window,
-    transcription_windows,
+    AudioWindow, TranscribeOptions, TranscriptSegment, Transcription, WindowTranscription,
+    transcribe_window_samples, transcription_windows,
 };
 use crate::{MelSpectrogram, load_audio_file};
 use anyhow::{Context, Result, anyhow};
@@ -74,10 +74,25 @@ impl ModelBytes {
 
 #[derive(Clone)]
 struct Job {
-    window: AudioWindow,
-    audio: Arc<[f32]>,
+    window_index: usize,
+    start_sample: usize,
+    end_sample: usize,
+    samples: Arc<[f32]>,
     tokenizer: Arc<Tokenizer>,
     options: Arc<TranscribeOptions>,
+}
+
+pub struct LiveWindow {
+    pub index: usize,
+    pub start_sample: usize,
+    pub end_sample: usize,
+    pub samples: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LiveTranscriptionStats {
+    pub windows_dispatched: usize,
+    pub windows_completed: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -114,14 +129,16 @@ impl<S: WhisperSpec> PipelineCtx<S> {
 
     fn transcribe_window(&self, job: Job) -> Result<WindowTranscription> {
         let mut decoder = WhisperDecoder::<S>::new(&self.decoder_rknn);
-        transcribe_audio_window(
-            &job.audio,
+        transcribe_window_samples(
+            &job.samples,
             &job.tokenizer,
             &self.mel_spec,
             &self.encoder,
             &self.enc_kv,
             &mut decoder,
-            &job.window,
+            job.window_index,
+            job.start_sample,
+            job.end_sample,
             &job.options,
         )
     }
@@ -216,6 +233,20 @@ impl<S: WhisperSpec + Send + 'static> ParallelTranscriberPool<S> {
         vad: Option<&VadModel>,
         options: &TranscribeOptions,
     ) -> Result<Transcription> {
+        self.transcribe_audio_with_segment_callback(audio, tokenizer, vad, options, |_| Ok(()))
+    }
+
+    pub fn transcribe_audio_with_segment_callback<F>(
+        &mut self,
+        audio: &[f32],
+        tokenizer: Arc<Tokenizer>,
+        vad: Option<&VadModel>,
+        options: &TranscribeOptions,
+        on_segment: F,
+    ) -> Result<Transcription>
+    where
+        F: FnMut(&TranscriptSegment) -> Result<()>,
+    {
         let vad_segments = if let Some(vad) = vad {
             vad.segments(audio)?
         } else {
@@ -244,9 +275,43 @@ impl<S: WhisperSpec + Send + 'static> ParallelTranscriberPool<S> {
         self.runtime.block_on(async {
             let dispatched =
                 dispatch_windows(windows, worker_txs, ready_rx, audio, tokenizer, options);
-            let collected = collect_ordered(result_rx, total_windows, vad_segments);
+            let collected =
+                collect_ordered_with_callback(result_rx, total_windows, vad_segments, on_segment);
             let (_, transcription) = tokio::try_join!(dispatched, collected)?;
             Ok(transcription)
+        })
+    }
+
+    pub fn transcribe_live_windows_with_callback<F>(
+        &mut self,
+        mut window_rx: mpsc::Receiver<Result<LiveWindow>>,
+        tokenizer: Arc<Tokenizer>,
+        options: &TranscribeOptions,
+        on_segment: F,
+    ) -> Result<(Transcription, LiveTranscriptionStats)>
+    where
+        F: FnMut(&TranscriptSegment) -> Result<()>,
+    {
+        let options = Arc::new(options.clone());
+        let worker_txs = self
+            .workers
+            .iter()
+            .map(|worker| worker.job_tx.clone())
+            .collect::<Vec<_>>();
+        let ready_rx = &mut self.ready_rx;
+        let result_rx = &mut self.result_rx;
+
+        self.runtime.block_on(async {
+            transcribe_live_windows(
+                &mut window_rx,
+                worker_txs,
+                ready_rx,
+                result_rx,
+                tokenizer,
+                options,
+                on_segment,
+            )
+            .await
         })
     }
 }
@@ -293,7 +358,7 @@ fn spawn_npu_worker<S: WhisperSpec + Send + 'static>(
                 .map_err(|_| anyhow!("worker {worker_id} ready channel closed"))?;
 
             while let Some(job) = job_rx.blocking_recv() {
-                let window_index = job.window.index;
+                let window_index = job.window_index;
                 let result = ctx
                     .transcribe_window(job)
                     .with_context(|| format!("worker {worker_id} failed on window {window_index}"));
@@ -335,8 +400,10 @@ async fn dispatch_windows(
             .ok_or_else(|| anyhow!("invalid worker id {}", ready.worker_id))?;
         worker_tx
             .send(Job {
-                window,
-                audio: audio.clone(),
+                window_index: window.index,
+                start_sample: window.start_sample,
+                end_sample: window.end_sample,
+                samples: Arc::<[f32]>::from(audio[window.start_sample..window.end_sample].to_vec()),
                 tokenizer: tokenizer.clone(),
                 options: options.clone(),
             })
@@ -347,11 +414,105 @@ async fn dispatch_windows(
     Ok(())
 }
 
-async fn collect_ordered(
+async fn transcribe_live_windows<F>(
+    window_rx: &mut mpsc::Receiver<Result<LiveWindow>>,
+    worker_txs: Vec<mpsc::Sender<Job>>,
+    ready_rx: &mut mpsc::Receiver<Ready>,
+    result_rx: &mut mpsc::Receiver<Result<WindowTranscription>>,
+    tokenizer: Arc<Tokenizer>,
+    options: Arc<TranscribeOptions>,
+    mut on_segment: F,
+) -> Result<(Transcription, LiveTranscriptionStats)>
+where
+    F: FnMut(&TranscriptSegment) -> Result<()>,
+{
+    let mut producer_closed = false;
+    let mut pending_windows = VecDeque::<LiveWindow>::new();
+    let mut ready_workers = VecDeque::<usize>::new();
+    let mut pending_results = BTreeMap::<usize, WindowTranscription>::new();
+    let mut next_result = 0usize;
+    let mut in_flight = 0usize;
+    let mut full_text = String::new();
+    let mut segments = Vec::new();
+    let mut stats = LiveTranscriptionStats::default();
+
+    loop {
+        while !ready_workers.is_empty() && !pending_windows.is_empty() {
+            let worker_id = ready_workers.pop_front().unwrap();
+            let window = pending_windows.pop_front().unwrap();
+            let worker_tx = worker_txs
+                .get(worker_id)
+                .ok_or_else(|| anyhow!("invalid worker id {worker_id}"))?;
+            worker_tx
+                .send(Job {
+                    window_index: window.index,
+                    start_sample: window.start_sample,
+                    end_sample: window.end_sample,
+                    samples: Arc::<[f32]>::from(window.samples),
+                    tokenizer: tokenizer.clone(),
+                    options: options.clone(),
+                })
+                .await
+                .map_err(|_| anyhow!("worker {worker_id} stopped before accepting a job"))?;
+            in_flight += 1;
+            stats.windows_dispatched += 1;
+        }
+
+        if producer_closed && pending_windows.is_empty() && in_flight == 0 {
+            break;
+        }
+
+        tokio::select! {
+            ready = ready_rx.recv(), if !producer_closed || !pending_windows.is_empty() => {
+                let ready = ready.ok_or_else(|| anyhow!("all NPU workers stopped"))?;
+                ready_workers.push_back(ready.worker_id);
+            }
+            window = window_rx.recv(), if !producer_closed => {
+                match window {
+                    Some(Ok(window)) => pending_windows.push_back(window),
+                    Some(Err(error)) => return Err(error),
+                    None => producer_closed = true,
+                }
+            }
+            result = result_rx.recv(), if in_flight > 0 => {
+                let result = result
+                    .ok_or_else(|| anyhow!("result channel closed before all windows completed"))??;
+                in_flight -= 1;
+                stats.windows_completed += 1;
+                pending_results.insert(result.window_index, result);
+
+                while let Some(result) = pending_results.remove(&next_result) {
+                    full_text.push_str(&result.text);
+                    full_text.push(' ');
+                    for segment in &result.segments {
+                        on_segment(segment)?;
+                    }
+                    segments.extend(result.segments);
+                    next_result += 1;
+                }
+            }
+        }
+    }
+
+    Ok((
+        Transcription {
+            text: full_text.trim().to_string(),
+            segments,
+            vad_segments: Vec::new(),
+        },
+        stats,
+    ))
+}
+
+async fn collect_ordered_with_callback<F>(
     result_rx: &mut mpsc::Receiver<Result<WindowTranscription>>,
     total_windows: usize,
     vad_segments: Vec<crate::vad::VadSegment>,
-) -> Result<Transcription> {
+    mut on_segment: F,
+) -> Result<Transcription>
+where
+    F: FnMut(&TranscriptSegment) -> Result<()>,
+{
     let mut pending = BTreeMap::<usize, WindowTranscription>::new();
     let mut next = 0usize;
     let mut full_text = String::new();
@@ -367,6 +528,9 @@ async fn collect_ordered(
         while let Some(result) = pending.remove(&next) {
             full_text.push_str(&result.text);
             full_text.push(' ');
+            for segment in &result.segments {
+                on_segment(segment)?;
+            }
             segments.extend(result.segments);
             next += 1;
         }
@@ -381,7 +545,7 @@ async fn collect_ordered(
 
 #[cfg(test)]
 mod tests {
-    use super::collect_ordered;
+    use super::collect_ordered_with_callback;
     use crate::whisper::WindowTranscription;
     use tokio::sync::mpsc;
 
@@ -394,15 +558,21 @@ mod tests {
         drop(tx);
 
         let mut rx = rx;
-        let transcription = collect_ordered(&mut rx, 3, Vec::new()).await.unwrap();
+        let transcription = collect_ordered_with_callback(&mut rx, 3, Vec::new(), |_| Ok(()))
+            .await
+            .unwrap();
         assert_eq!(transcription.text, "one two three");
     }
 
     #[tokio::test]
     async fn collect_ordered_reports_early_close() {
-        let (_tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+
         let mut rx = rx;
-        let error = collect_ordered(&mut rx, 1, Vec::new()).await.unwrap_err();
+        let error = collect_ordered_with_callback(&mut rx, 1, Vec::new(), |_| Ok(()))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("result channel closed"));
     }
 
