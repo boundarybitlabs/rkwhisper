@@ -1,9 +1,8 @@
 use crate::SAMPLE_RATE;
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,32 +12,20 @@ pub const DEFAULT_SOCKET_PATH: &str = "/run/rkwhisper/asr.sock";
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/rkwhisper.toml";
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct RequestHeader {
     pub model: String,
-    #[serde(default = "default_mode")]
     pub mode: String,
-    #[serde(default = "default_lang")]
     pub lang: String,
-    #[serde(default = "default_task")]
     pub task: String,
-    #[serde(default = "default_max_new_tokens")]
     pub max_new_tokens: usize,
-    #[serde(default = "default_beam_size")]
     pub beam_size: usize,
-    #[serde(default)]
     pub notimestamps: bool,
-    #[serde(default = "default_suppress_tokens")]
     pub suppress_tokens: String,
-    #[serde(default)]
     pub vad_threshold: Option<f32>,
-    #[serde(default)]
     pub vad_min_speech_ms: Option<u32>,
-    #[serde(default)]
     pub vad_min_silence_ms: Option<u32>,
-    #[serde(default)]
     pub vad_speech_pad_ms: Option<u32>,
-    #[serde(default)]
     pub vad_window_samples: Option<usize>,
 }
 
@@ -75,17 +62,6 @@ pub struct ModelFiles {
     pub vad: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "type")]
-pub enum DaemonResponse<'a> {
-    #[serde(rename = "segment")]
-    Segment { text: &'a str, begin: f32, end: f32 },
-    #[serde(rename = "done")]
-    Done { audio_s: f32, rtf: f32 },
-    #[serde(rename = "error")]
-    Error { error: &'a str },
-}
-
 pub fn default_model_root() -> PathBuf {
     std::env::var_os(MODEL_ROOT_ENV)
         .map(PathBuf::from)
@@ -102,80 +78,6 @@ pub fn parse_config(contents: &str) -> Result<DaemonConfig> {
     let config: DaemonConfig = toml::from_str(contents)?;
     validate_config(&config)?;
     Ok(config)
-}
-
-pub fn read_request<R: Read>(reader: &mut R) -> Result<DaemonRequest> {
-    let header = read_header(reader)?;
-    read_request_body(header, reader)
-}
-
-pub fn read_request_body<R: Read>(header: RequestHeader, reader: &mut R) -> Result<DaemonRequest> {
-    if header.mode != "batch" && header.mode != "stream" {
-        bail!("unsupported mode {:?}", header.mode);
-    }
-    if header.beam_size == 0 {
-        bail!("beam_size must be at least 1");
-    }
-
-    let audio = read_pcm_frame(reader)?.ok_or_else(|| anyhow!("empty audio"))?;
-
-    Ok(DaemonRequest { header, audio })
-}
-
-pub fn read_pcm_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<f32>>> {
-    let mut len_buf = [0u8; 4];
-    let n = reader
-        .read(&mut len_buf[..1])
-        .context("failed to read PCM byte count")?;
-    if n == 0 {
-        return Ok(None);
-    }
-    reader
-        .read_exact(&mut len_buf[1..])
-        .context("failed to read PCM byte count")?;
-
-    let pcm_len = i32::from_le_bytes(len_buf);
-    if pcm_len < 0 {
-        bail!("negative PCM byte count");
-    }
-    let pcm_len = pcm_len as usize;
-    if pcm_len == 0 {
-        return Ok(None);
-    }
-    if pcm_len % 2 != 0 {
-        bail!("PCM byte count must be even for s16le audio");
-    }
-
-    let mut pcm = vec![0u8; pcm_len];
-    reader
-        .read_exact(&mut pcm)
-        .context("failed to read PCM body")?;
-    let audio = pcm_s16le_to_f32(&pcm)?;
-
-    Ok(Some(audio))
-}
-
-pub fn read_header<R: Read>(reader: &mut R) -> Result<RequestHeader> {
-    let mut bytes = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = reader
-            .read(&mut byte)
-            .context("failed to read JSON header")?;
-        if n == 0 {
-            bail!("connection closed before JSON header newline");
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        bytes.push(byte[0]);
-        if bytes.len() > MAX_HEADER_BYTES {
-            bail!("JSON header exceeds {MAX_HEADER_BYTES} bytes");
-        }
-    }
-
-    let header = std::str::from_utf8(&bytes).context("JSON header is not valid UTF-8")?;
-    serde_json::from_str(header).context("failed to parse JSON header")
 }
 
 pub fn pcm_s16le_to_f32(pcm: &[u8]) -> Result<Vec<f32>> {
@@ -253,12 +155,6 @@ fn resolve_model_files_for_kind(
     })
 }
 
-pub fn response_line(response: &DaemonResponse<'_>) -> Result<String> {
-    let mut line = serde_json::to_string(response)?;
-    line.push('\n');
-    Ok(line)
-}
-
 fn required_file(dir: &Path, name: &str) -> Result<PathBuf> {
     let path = dir.join(name);
     if path.is_file() {
@@ -309,101 +205,11 @@ fn model_kind(model_id: &str) -> Option<ModelKind> {
     }
 }
 
-fn default_mode() -> String {
-    "batch".to_string()
-}
-
-fn default_lang() -> String {
-    "en".to_string()
-}
-
-fn default_task() -> String {
-    "transcribe".to_string()
-}
-
-fn default_max_new_tokens() -> usize {
-    128
-}
-
-fn default_beam_size() -> usize {
-    5
-}
-
-fn default_suppress_tokens() -> String {
-    "default".to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::{self, File};
-    use std::io::Cursor;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn reads_framed_batch_request() {
-        let mut bytes = br#"{"model":"whisper-small-30s","beam_size":2,"mode":"batch"}"#.to_vec();
-        bytes.push(b'\n');
-        bytes.extend_from_slice(&4i32.to_le_bytes());
-        bytes.extend_from_slice(&0i16.to_le_bytes());
-        bytes.extend_from_slice(&i16::MAX.to_le_bytes());
-
-        let request = read_request(&mut Cursor::new(bytes)).unwrap();
-        assert_eq!(request.header.model, "whisper-small-30s");
-        assert_eq!(request.header.beam_size, 2);
-        assert_eq!(request.audio, vec![0.0, 1.0]);
-    }
-
-    #[test]
-    fn reads_framed_stream_request() {
-        let mut bytes = br#"{"model":"whisper-small-30s","mode":"stream"}"#.to_vec();
-        bytes.push(b'\n');
-        bytes.extend_from_slice(&2i32.to_le_bytes());
-        bytes.extend_from_slice(&0i16.to_le_bytes());
-
-        let request = read_request(&mut Cursor::new(bytes)).unwrap();
-        assert_eq!(request.header.mode, "stream");
-        assert_eq!(request.audio, vec![0.0]);
-    }
-
-    #[test]
-    fn rejects_invalid_pcm_lengths() {
-        let mut negative = br#"{"model":"whisper-small-30s"}"#.to_vec();
-        negative.push(b'\n');
-        negative.extend_from_slice(&(-1i32).to_le_bytes());
-        assert!(read_request(&mut Cursor::new(negative)).is_err());
-
-        let mut odd = br#"{"model":"whisper-small-30s"}"#.to_vec();
-        odd.push(b'\n');
-        odd.extend_from_slice(&1i32.to_le_bytes());
-        odd.push(0);
-        assert!(read_request(&mut Cursor::new(odd)).is_err());
-    }
-
-    #[test]
-    fn rejects_truncated_frames() {
-        let missing_newline = br#"{"model":"whisper-small-30s"}"#.to_vec();
-        assert!(read_request(&mut Cursor::new(missing_newline)).is_err());
-
-        let mut short_body = br#"{"model":"whisper-small-30s"}"#.to_vec();
-        short_body.push(b'\n');
-        short_body.extend_from_slice(&4i32.to_le_bytes());
-        short_body.extend_from_slice(&0i16.to_le_bytes());
-        assert!(read_request(&mut Cursor::new(short_body)).is_err());
-    }
-
-    #[test]
-    fn rejects_zero_beam_size() {
-        let mut bytes = br#"{"model":"whisper-small-30s","beam_size":0}"#.to_vec();
-        bytes.push(b'\n');
-        bytes.extend_from_slice(&2i32.to_le_bytes());
-        bytes.extend_from_slice(&0i16.to_le_bytes());
-
-        let err = read_request(&mut Cursor::new(bytes))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("beam_size"));
-    }
 
     #[test]
     fn converts_s16le_pcm() {
@@ -516,19 +322,6 @@ models = [
         assert!(err.contains("model file missing: mel.rknn"));
 
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn serializes_single_line_responses() {
-        let line = response_line(&DaemonResponse::Segment {
-            text: "Eeenie, meanie, minie, mo",
-            begin: 45.6,
-            end: 52.7,
-        })
-        .unwrap();
-        assert!(line.ends_with('\n'));
-        assert!(line.contains(r#""type":"segment""#));
-        assert!(line.contains(r#""begin":45.6"#));
     }
 
     fn unique_temp_dir() -> PathBuf {

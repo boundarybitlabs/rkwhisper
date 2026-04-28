@@ -184,41 +184,31 @@ ExecStart=/usr/bin/rkwhisperd --socket /run/rkwhisper/asr.sock
 
 ## Daemon Protocol
 
-Clients send a newline-terminated JSON header followed by one or more framed
-s16le PCM payloads.
+`rkwhisperd` uses a v1 Unix socket protocol with Protobuf control messages and
+shared-memory PCM transfer.
 
-Batch requests send one PCM frame:
+Connection flow:
 
-```text
-{"model":"whisper-small-30s","mode":"batch","beam_size":5}
-\n
-<4-byte little-endian byte length><s16le PCM bytes>
-```
+1. Client sends a 4-byte little-endian length followed by a Protobuf
+   `ClientHello`.
+2. Server validates that the requested audio format is 16 kHz mono s16le.
+3. Server creates a 30-second audio ring buffer in a `memfd`.
+4. Server sends the `memfd` to the client with `SCM_RIGHTS`.
+5. Server sends a length-prefixed Protobuf `ServerHello`.
+6. Client writes s16le PCM bytes into the shared ring and sends one-byte socket
+   signals.
+7. Server replies with length-prefixed Protobuf `segment`, `done`, or `error`
+   responses.
 
-Stream requests send multiple PCM frames and close the write side when done:
+Signal bytes:
 
-```text
-{"model":"whisper-small-30s","mode":"stream"}
-\n
-<frame length><s16le PCM bytes>
-<frame length><s16le PCM bytes>
-...
-```
+- `0x01`: data ready
+- `0x02`: end of stream
+- `0x03`: cancel
 
-Responses are newline-delimited JSON:
+The checked-in schema is [proto/rkwhisper.proto](proto/rkwhisper.proto).
 
-```json
-{"type":"segment","text":"hello world","begin":0.0,"end":1.2}
-{"type":"done","audio_s":30.0,"rtf":0.42}
-```
-
-Errors are also returned as one-line JSON:
-
-```json
-{"type":"error","error":"model not found"}
-```
-
-Request header defaults:
+`ClientHello` defaults:
 
 - `mode`: `batch`
 - `lang`: `en`
@@ -228,7 +218,7 @@ Request header defaults:
 - `notimestamps`: `false`
 - `suppress_tokens`: `default`
 
-The header may also include VAD overrides:
+`ClientHello` may also include VAD overrides:
 
 - `vad_threshold`
 - `vad_min_speech_ms`

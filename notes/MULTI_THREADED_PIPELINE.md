@@ -31,8 +31,10 @@ because it determines the audio windows. If VAD is not configured, the
 coordinator builds fixed 30-second windows. Once windows exist, each window is
 independent and can be processed by any available NPU worker.
 
-For live daemon streams, incoming s16le PCM frames are buffered into 30-second
-windows and a final shorter window is dispatched when the stream closes.
+For daemon requests, clients write 16 kHz mono s16le PCM into a shared-memory
+ring buffer passed with `SCM_RIGHTS`. The server copies ready bytes out of the
+ring, buffers them into 30-second windows, and dispatches a final shorter window
+at end-of-stream.
 
 | Stage | Owner | Description |
 |---|---|---|

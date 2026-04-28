@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package rkwhisper;
+
+enum SampleFormat {
+  SAMPLE_FORMAT_UNSPECIFIED = 0;
+  SAMPLE_FORMAT_S16LE = 1;
+}
+
+message AudioFormat {
+  uint32 sample_rate = 1;
+  uint32 channels = 2;
+  SampleFormat sample_format = 3;
+}
+
+message VadOptions {
+  optional float threshold = 1;
+  optional uint32 min_speech_ms = 2;
+  optional uint32 min_silence_ms = 3;
+  optional uint32 speech_pad_ms = 4;
+  optional uint32 window_samples = 5;
+}
+
+message ClientHello {
+  string model = 1;
+  string mode = 2;
+  string lang = 3;
+  string task = 4;
+  uint32 max_new_tokens = 5;
+  uint32 beam_size = 6;
+  bool notimestamps = 7;
+  string suppress_tokens = 8;
+  AudioFormat audio_format = 9;
+  VadOptions vad = 10;
+}
+
+message ServerHello {
+  AudioFormat audio_format = 1;
+  uint64 ring_capacity_bytes = 2;
+  uint32 ring_header_bytes = 3;
+}
+
+message Segment {
+  string text = 1;
+  float begin = 2;
+  float end = 3;
+}
+
+message Done {
+  float audio_s = 1;
+  float rtf = 2;
+}
+
+message Error {
+  string error = 1;
+}
+
+message Response {
+  oneof message {
+    ServerHello server_hello = 1;
+    Segment segment = 2;
+    Done done = 3;
+    Error error = 4;
+  }
+}
