@@ -72,9 +72,11 @@ pending windows, and reorders results by window index.
 2. Resolves enabled model directories under `RKWHISPER_MODEL_ROOT` or
    `/usr/share/rkwhisper`.
 3. Creates one persistent `ParallelTranscriberPool` per enabled model.
-4. Accepts newline-terminated JSON request headers followed by framed s16le PCM.
-5. Supports batch requests and live streaming requests.
-6. Emits newline-delimited JSON `segment`, `done`, or `error` responses.
+4. Accepts length-prefixed Protobuf `ClientHello` control messages.
+5. Creates a `memfd` shared-memory ring for 16 kHz mono s16le PCM and passes the
+   file descriptor to clients with `SCM_RIGHTS`.
+6. Supports batch requests as a degenerate stream and live streaming requests.
+7. Emits length-prefixed Protobuf `segment`, `done`, or `error` responses.
 
 Each configured model directory must contain `tokenizer.json`, `mel.rknn`,
 `encoder.rknn`, `enc_kv.rknn`, and `decoder.rknn`. If `vad.rknn` is present,
@@ -256,7 +258,7 @@ The test suite covers:
 - left compaction
 - slice views
 - fill/compact/append behavior
-- daemon request framing, PCM conversion, config parsing, and model resolution
+- daemon Protobuf framing, PCM conversion, config parsing, and model resolution
 - suppression mode parsing
 - VAD segment merging, padding, and short-speech filtering
 - fixed and VAD-derived transcription windowing
