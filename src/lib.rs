@@ -15,6 +15,7 @@ pub mod daemon;
 pub mod decoder;
 pub mod encoder;
 pub mod parallel;
+pub mod protocol;
 pub mod spec;
 pub mod suppression;
 pub mod vad;
