@@ -255,6 +255,15 @@ def read_responses_file(stream, text_only: bool, transcript_parts: list[str], st
             print(message.get("error", "daemon error"), file=sys.stderr)
             status["code"] = 1
             return
+        elif msg_type == "cancelled":
+            if not text_only:
+                print(message, flush=True)
+            status["code"] = 130
+            return
+        elif msg_type == "back_off":
+            print(message.get("reason", "daemon busy"), file=sys.stderr)
+            status["code"] = 75
+            return
         else:
             print(message, flush=True)
 
@@ -321,6 +330,10 @@ def decode_response(body: bytes) -> dict:
             return decode_done(value)
         if field == 4 and wire == 2:
             return decode_error(value)
+        if field == 5 and wire == 2:
+            return decode_cancelled(value)
+        if field == 6 and wire == 2:
+            return decode_back_off(value)
     return {"type": "unknown"}
 
 
@@ -361,6 +374,36 @@ def decode_error(body: bytes) -> dict:
     for field, wire, value in iter_fields(body):
         if field == 1 and wire == 2:
             response["error"] = value.decode("utf-8")
+    return response
+
+
+def decode_cancelled(body: bytes) -> dict:
+    response = {
+        "type": "cancelled",
+        "audio_s": 0.0,
+        "rtf": 0.0,
+        "windows_dispatched": 0,
+        "windows_completed": 0,
+    }
+    for field, wire, value in iter_fields(body):
+        if field == 1 and wire == 5:
+            response["audio_s"] = value
+        elif field == 2 and wire == 5:
+            response["rtf"] = value
+        elif field == 3 and wire == 0:
+            response["windows_dispatched"] = value
+        elif field == 4 and wire == 0:
+            response["windows_completed"] = value
+    return response
+
+
+def decode_back_off(body: bytes) -> dict:
+    response = {"type": "back_off", "reason": "daemon busy", "retry_after_ms": 0}
+    for field, wire, value in iter_fields(body):
+        if field == 1 and wire == 2:
+            response["reason"] = value.decode("utf-8")
+        elif field == 2 and wire == 0:
+            response["retry_after_ms"] = value
     return response
 
 
