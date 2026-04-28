@@ -141,6 +141,11 @@ models = [
   "whisper-small-30s",
   "whisper-medium-30s",
 ]
+
+[concurrency]
+model_queue_depth = 1
+client_window_queue_depth = 4
+client_response_queue_depth = 16
 ```
 
 Run the daemon with defaults:
@@ -164,11 +169,16 @@ cargo run --release --bin rkwhisperd -- \
   --socket /tmp/rkwhisper.sock
 ```
 
-`rkwhisperd` creates one persistent three-worker `ParallelTranscriberPool` per
-enabled model. For packaged installs, run the service as the `rkwhisper` user
-and group and let systemd create `/run/rkwhisper` with `RuntimeDirectory`.
-`rkwhisperd` binds the socket and sets its mode to `0660`; it does not change
-socket ownership at startup.
+`rkwhisperd` creates one scheduler thread and one persistent three-worker
+`ParallelTranscriberPool` per enabled model. Session threads accept clients
+concurrently, while each model scheduler processes transcription jobs serially.
+The concurrency limits are bounded and configurable; all queue depths must be at
+least 1.
+
+For packaged installs, run the service as the `rkwhisper` user and group and let
+systemd create `/run/rkwhisper` with `RuntimeDirectory`. `rkwhisperd` binds the
+socket and sets its mode to `0660`; it does not change socket ownership at
+startup.
 
 A typical service setup uses:
 
@@ -197,14 +207,19 @@ Connection flow:
 5. Server sends a length-prefixed Protobuf `ServerHello`.
 6. Client writes s16le PCM bytes into the shared ring and sends one-byte socket
    signals.
-7. Server replies with length-prefixed Protobuf `segment`, `done`, or `error`
-   responses.
+7. Server replies with length-prefixed Protobuf `segment`, `done`,
+   `cancelled`, `back_off`, or `error` responses.
 
 Signal bytes:
 
 - `0x01`: data ready
 - `0x02`: end of stream
 - `0x03`: cancel
+
+Live streams fail fast with `back_off` when their next audio window cannot be
+accepted immediately. Ring buffer overruns are reported as protocol errors
+instead of silently dropping audio. Client cancellation returns `cancelled` with
+partial timing and window stats.
 
 The checked-in schema is [proto/rkwhisper.proto](proto/rkwhisper.proto).
 
