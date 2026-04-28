@@ -19,6 +19,8 @@ keeping RKNN/NPU contention explicit.
 - Make NPU sharing deliberate instead of allowing many clients to run model
   inference at once accidentally.
 - Return clear busy or queue-full errors when the daemon is saturated.
+- Treat shared-memory ring overruns as protocol errors instead of silently
+  dropping audio.
 
 ## Non-Goals
 
@@ -89,18 +91,50 @@ window messages and does not need to know about sockets or file descriptors.
 Use bounded channels at every queue boundary:
 
 - Accept backlog: controlled by the Unix listener and OS socket backlog.
-- Per-model job queue: small, configurable, for example 1 to 4 pending jobs.
-- Per-client window queue: small, currently 4 `LiveWindow` messages.
-- Per-client response queue: bounded to prevent a slow reader from consuming
-  unbounded memory.
+- Per-model job queue: configurable, with a conservative default such as 1
+  pending job per model.
+- Per-client window queue: configurable, with the current hard-coded value of 4
+  `LiveWindow` messages as the initial default.
+- Per-client response queue: configurable and bounded to prevent a slow reader
+  from consuming unbounded memory.
+
+These limits should live in daemon configuration rather than protocol messages,
+because they are operational capacity controls:
+
+```toml
+[concurrency]
+model_queue_depth = 1
+client_window_queue_depth = 4
+client_response_queue_depth = 16
+```
+
+Validation should reject zero for all queue depths. If the daemon later supports
+separate batch and live scheduling, these settings can split into mode-specific
+limits without changing the wire protocol.
 
 When the selected model queue is full, the session should return a Protobuf
 `error` response such as `model queue full` and close the connection.
 
+Live streams should fail fast when their next audio window cannot be accepted
+immediately. For example, if client A is connected in `stream` mode but has not
+sent audio recently, and client B fills the available batch/model queues before
+A sends more audio, A should receive a structured back-off response rather than
+waiting indefinitely. This keeps stale or bursty live streams from hiding
+capacity exhaustion and lets the client retry with an explicit delay.
+
+The back-off response should be distinct enough for clients to distinguish it
+from unrecoverable protocol errors. At minimum it should include a reason such
+as `model queue full` or `client window queue full`; if the protocol adds
+machine-readable fields, include a retry/back-off hint such as
+`retry_after_ms`.
+
 When the client writes audio faster than the daemon can consume it, the ring
-buffer naturally overwrites old audio if the writer gets too far ahead. The
-protocol should either document this as drop-oldest behavior or add explicit
-overrun detection by comparing write and read offsets before draining.
+buffer can overwrite old audio if the writer gets too far ahead. The daemon
+should detect this explicitly by comparing write and read offsets before
+draining. If `write - read > ring_capacity`, the session should report a
+structured protocol error such as `shared-memory ring overrun` and close the
+connection. Silent drop-oldest behavior would make transcripts look valid while
+hiding lost audio, so it should not be part of the stable protocol.
 
 ## Cancellation
 
@@ -108,9 +142,10 @@ Cancellation should remain client-local:
 
 - `SIGNAL_CANCEL` closes the client's `LiveWindow` stream.
 - The scheduler should stop the active job after the current inference boundary.
-- The session should return either `done` with partial timing stats or `error`
-  with a cancellation message. The exact response should be standardized before
-  exposing this as stable protocol behavior.
+- The session should return a distinct cancellation response with partial timing
+  stats. This keeps client-initiated cancellation separate from successful
+  completion and from failure while still reporting how much audio was accepted
+  and how much work completed before cancellation.
 
 If the client disconnects, the session should drop the job's window sender and
 response receiver. The scheduler should treat that as cancellation.
@@ -125,10 +160,16 @@ Recommended errors:
 - unsupported audio format
 - unknown model
 - model queue full
+- client window queue full
+- client response queue full
+- back off
 - shared-memory setup failed
+- shared-memory ring overrun
 - client disconnected
-- stream cancelled
 - inference failed
+
+Cancellation should use its own response variant rather than the generic error
+variant.
 
 The daemon should still log errors with connection/model context, but clients
 need structured responses for recovery.
@@ -144,6 +185,7 @@ need structured responses for recovery.
    - Include `RequestHeader`.
    - Include `mpsc::Receiver<Result<LiveWindow>>`.
    - Include a bounded response sender for `Response`.
+   - Add a cancellation response variant that includes partial stats.
 
 3. Split session I/O from inference.
    - Keep socket negotiation and shared-memory ring handling in the session
@@ -153,19 +195,32 @@ need structured responses for recovery.
 4. Add queue-full behavior.
    - Use nonblocking `try_send` or a short timeout when submitting jobs.
    - Return a Protobuf `error` if the selected model is saturated.
+   - Apply configured limits to the per-model job queue, per-client window
+     queue, and per-client response queue.
+   - For live streams, fail fast with a structured back-off response when a new
+     audio window cannot be accepted immediately.
 
-5. Add client disconnect handling.
+5. Add ring overrun detection.
+   - Change ring draining to return an overrun error when the writer is more
+     than one ring capacity ahead of the reader.
+   - Send the error through the client response path as a protocol error and
+     close the session.
+
+6. Add client disconnect handling.
    - Treat read failure, write failure, and dropped channels as cancellation.
    - Ensure the reader thread exits and the memfd mapping is released.
 
-6. Add tests.
+7. Add tests.
    - Unit-test scheduler queue-full behavior.
+   - Unit-test configured queue-depth parsing and validation.
    - Unit-test unknown model errors.
+   - Unit-test ring overrun detection.
    - Add an integration-style daemon test with two clients where the second
      connection receives either queued service or a structured busy error.
 
-7. Document operational limits.
-   - Add config for per-model queue depth.
+8. Document operational limits.
+   - Add config for per-model queue depth, per-client window queue depth, and
+     per-client response queue depth.
    - Document that each model is processed serially unless multiple model pool
      replicas are configured in the future.
 
@@ -184,10 +239,5 @@ inference may reduce throughput or increase tail latency.
 
 ## Open Questions
 
-- Should a queued live stream wait for scheduler capacity, or should live
-  streams fail fast when the model is busy?
-- Should cancellation return `done` with partial stats or a distinct
-  cancellation response?
-- Should ring overruns be detected and reported as protocol errors?
 - Should the daemon support separate limits for batch-style finite streams and
   long-running live streams?
