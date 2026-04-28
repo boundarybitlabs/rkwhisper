@@ -38,6 +38,28 @@ pub struct DaemonRequest {
 #[derive(Clone, Debug, Deserialize)]
 pub struct DaemonConfig {
     pub models: Vec<String>,
+    #[serde(default)]
+    pub concurrency: ConcurrencyConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ConcurrencyConfig {
+    #[serde(default = "default_model_queue_depth")]
+    pub model_queue_depth: usize,
+    #[serde(default = "default_client_window_queue_depth")]
+    pub client_window_queue_depth: usize,
+    #[serde(default = "default_client_response_queue_depth")]
+    pub client_response_queue_depth: usize,
+}
+
+impl Default for ConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            model_queue_depth: default_model_queue_depth(),
+            client_window_queue_depth: default_client_window_queue_depth(),
+            client_response_queue_depth: default_client_response_queue_depth(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,6 +201,7 @@ fn validate_config(config: &DaemonConfig) -> Result<()> {
     if config.models.is_empty() {
         bail!("config must list at least one model");
     }
+    validate_concurrency_config(&config.concurrency)?;
 
     let mut seen = HashSet::new();
     for model_id in &config.models {
@@ -192,6 +215,31 @@ fn validate_config(config: &DaemonConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_concurrency_config(config: &ConcurrencyConfig) -> Result<()> {
+    if config.model_queue_depth == 0 {
+        bail!("concurrency.model_queue_depth must be at least 1");
+    }
+    if config.client_window_queue_depth == 0 {
+        bail!("concurrency.client_window_queue_depth must be at least 1");
+    }
+    if config.client_response_queue_depth == 0 {
+        bail!("concurrency.client_response_queue_depth must be at least 1");
+    }
+    Ok(())
+}
+
+fn default_model_queue_depth() -> usize {
+    1
+}
+
+fn default_client_window_queue_depth() -> usize {
+    4
+}
+
+fn default_client_response_queue_depth() -> usize {
+    16
 }
 
 fn model_kind(model_id: &str) -> Option<ModelKind> {
@@ -252,6 +300,28 @@ models = [
         assert!(model_is_enabled(&config, "whisper-small-30s"));
         assert!(model_is_enabled(&config, "whisper-medium-30s"));
         assert!(!model_is_enabled(&config, "whisper-base-30s"));
+        assert_eq!(config.concurrency.model_queue_depth, 1);
+        assert_eq!(config.concurrency.client_window_queue_depth, 4);
+        assert_eq!(config.concurrency.client_response_queue_depth, 16);
+    }
+
+    #[test]
+    fn parses_concurrency_config() {
+        let config = parse_config(
+            r#"
+models = ["whisper-small-30s"]
+
+[concurrency]
+model_queue_depth = 2
+client_window_queue_depth = 8
+client_response_queue_depth = 32
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.concurrency.model_queue_depth, 2);
+        assert_eq!(config.concurrency.client_window_queue_depth, 8);
+        assert_eq!(config.concurrency.client_response_queue_depth, 32);
     }
 
     #[test]
@@ -281,6 +351,19 @@ models = [
                 .unwrap_err()
                 .to_string()
                 .contains("unsupported model id")
+        );
+        assert!(
+            parse_config(
+                r#"
+models = ["whisper-small-30s"]
+
+[concurrency]
+model_queue_depth = 0
+"#
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("model_queue_depth")
         );
     }
 
