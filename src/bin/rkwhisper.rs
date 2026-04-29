@@ -5,15 +5,16 @@ use rkwhisper::{
     MelSpectrogram,
     decoder::WhisperDecoder,
     encoder::{EncKvModel, WhisperEncoder},
-    parallel::{ParallelModelPaths, transcribe_file_parallel_with_options},
+    parallel::ParallelModelPaths,
     spec::{
         WhisperBase, WhisperLargeV3Turbo, WhisperMedium, WhisperSmall, WhisperSpec, WhisperTiny,
     },
     suppression::SuppressTokens,
     vad::{VadConfig, VadModel},
-    whisper::{TranscribeOptions, transcribe_with_options},
+    whisper::{TranscribeOptions, transcribe_audio_with_options},
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(ValueEnum, Clone, Debug)]
 enum Model {
@@ -144,8 +145,18 @@ fn run<S: WhisperSpec + Send + 'static>(args: Args, lib: &Path) -> Result<()> {
         SuppressTokens::parse(&args.suppress_tokens)?,
     );
 
+    let wav_path = args.wav.to_string_lossy();
+    let tokenizer_path = args.tokenizer.to_string_lossy();
+
     if args.multi_npu {
-        let vad = if let Some(path) = &args.vad_model {
+        let model_paths = ParallelModelPaths::new(
+            args.mel_spec.clone(),
+            args.encoder.clone(),
+            args.enc_kv.clone(),
+            args.decoder.clone(),
+        );
+
+        let vad_segments = if let Some(path) = &args.vad_model {
             let config = VadConfig {
                 threshold: args.vad_threshold,
                 min_speech_ms: args.vad_min_speech_ms,
@@ -153,25 +164,28 @@ fn run<S: WhisperSpec + Send + 'static>(args: Args, lib: &Path) -> Result<()> {
                 speech_pad_ms: args.vad_speech_pad_ms,
                 window_samples: args.vad_window_samples,
             };
-            Some(VadModel::new(
+            let vad = VadModel::new(
                 RKNN::new_with_library(lib, &mut std::fs::read(path)?, 0)?,
                 config,
-            ))
+            );
+            let audio = rkwhisper::load_audio_file(wav_path.as_ref())?;
+            vad.segments(&audio)?
         } else {
-            None
+            Vec::new()
         };
-        let model_paths = ParallelModelPaths::new(
-            args.mel_spec.clone(),
-            args.encoder.clone(),
-            args.enc_kv.clone(),
-            args.decoder.clone(),
+
+        let mut pool = rkwhisper::parallel::ParallelTranscriberPool::<S>::new(lib, &model_paths)?;
+        let tokenizer = Arc::new(
+            tokenizers::Tokenizer::from_file(tokenizer_path.as_ref())
+                .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?,
         );
-        let transcription = transcribe_file_parallel_with_options::<S>(
-            &args.wav.to_string_lossy(),
-            &args.tokenizer.to_string_lossy(),
-            &model_paths,
-            vad.as_ref(),
+        let audio = rkwhisper::load_audio_file(wav_path.as_ref())?;
+        let transcription = pool.transcribe_audio_with_segment_callback(
+            &audio,
+            tokenizer,
+            &vad_segments,
             &options,
+            |_| Ok(()),
         )?;
         return print_transcription(transcription, &args.output);
     }
@@ -197,7 +211,8 @@ fn run<S: WhisperSpec + Send + 'static>(args: Args, lib: &Path) -> Result<()> {
     let dec_rknn = RKNN::new_with_library(lib, &mut std::fs::read(&args.decoder)?, 0)?;
     let mut decoder = WhisperDecoder::<S>::new(&dec_rknn);
 
-    let vad = if let Some(path) = &args.vad_model {
+    let audio = rkwhisper::load_audio_file(wav_path.as_ref())?;
+    let vad_segments = if let Some(path) = &args.vad_model {
         let config = VadConfig {
             threshold: args.vad_threshold,
             min_speech_ms: args.vad_min_speech_ms,
@@ -205,22 +220,25 @@ fn run<S: WhisperSpec + Send + 'static>(args: Args, lib: &Path) -> Result<()> {
             speech_pad_ms: args.vad_speech_pad_ms,
             window_samples: args.vad_window_samples,
         };
-        Some(VadModel::new(
+        let vad = VadModel::new(
             RKNN::new_with_library(lib, &mut std::fs::read(path)?, 0)?,
             config,
-        ))
+        );
+        vad.segments(&audio)?
     } else {
-        None
+        Vec::new()
     };
 
-    let transcription = transcribe_with_options(
-        &args.wav.to_string_lossy(),
-        &args.tokenizer.to_string_lossy(),
+    let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path.as_ref())
+        .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
+    let transcription = transcribe_audio_with_options(
+        &audio,
+        &tokenizer,
         &mel_spec,
         &encoder,
         &enc_kv,
         &mut decoder,
-        vad.as_ref(),
+        &vad_segments,
         &options,
     )?;
 

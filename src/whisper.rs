@@ -3,7 +3,7 @@ use crate::decoder::{WhisperDecoder, WhisperDecoderState};
 use crate::encoder::{EncKvModel, WhisperEncoder};
 use crate::spec::WhisperSpec;
 use crate::suppression::{SuppressTokens, TokenSuppressor};
-use crate::vad::{VadModel, VadSegment, samples_to_sec};
+use crate::vad::{VadSegment, samples_to_sec};
 use crate::{MelSpectrogram, N_SAMPLES, load_audio_file};
 use anyhow::{Result, anyhow};
 use serde::Serialize;
@@ -98,7 +98,7 @@ pub fn transcribe<S: WhisperSpec>(
         encoder,
         enc_kv,
         decoder,
-        None,
+        &[],
         &options,
     )?
     .text)
@@ -111,14 +111,21 @@ pub fn transcribe_with_options<S: WhisperSpec>(
     encoder: &WhisperEncoder<S>,
     enc_kv: &EncKvModel<S>,
     decoder: &mut WhisperDecoder<S>,
-    vad: Option<&VadModel>,
+    vad_segments: &[VadSegment],
     options: &TranscribeOptions,
 ) -> Result<Transcription> {
     let tokenizer = Tokenizer::from_file(tokenizer_path)
         .map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
     let audio = load_audio_file(audio_path)?;
     transcribe_audio_with_options(
-        &audio, &tokenizer, mel_spec, encoder, enc_kv, decoder, vad, options,
+        &audio,
+        &tokenizer,
+        mel_spec,
+        encoder,
+        enc_kv,
+        decoder,
+        vad_segments,
+        options,
     )
 }
 
@@ -129,17 +136,11 @@ pub fn transcribe_audio_with_options<S: WhisperSpec>(
     encoder: &WhisperEncoder<S>,
     enc_kv: &EncKvModel<S>,
     decoder: &mut WhisperDecoder<S>,
-    vad: Option<&VadModel>,
+    vad_segments: &[VadSegment],
     options: &TranscribeOptions,
 ) -> Result<Transcription> {
-    let vad_enabled = vad.is_some();
-    let vad_segments = if let Some(vad) = vad {
-        vad.segments(audio)?
-    } else {
-        Vec::new()
-    };
-    let windows = if vad_enabled {
-        vad_audio_windows(&vad_segments)
+    let windows = if !vad_segments.is_empty() {
+        vad_audio_windows(vad_segments)
     } else {
         fixed_audio_windows(audio.len())
     };
@@ -158,7 +159,7 @@ pub fn transcribe_audio_with_options<S: WhisperSpec>(
     Ok(Transcription {
         text: full_text.trim().to_string(),
         segments,
-        vad_segments,
+        vad_segments: vad_segments.to_vec(),
     })
 }
 

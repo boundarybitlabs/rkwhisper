@@ -1,7 +1,6 @@
 use crate::decoder::WhisperDecoder;
 use crate::encoder::{EncKvModel, WhisperEncoder};
 use crate::spec::WhisperSpec;
-use crate::vad::VadModel;
 use crate::whisper::{
     AudioWindow, TranscribeOptions, TranscriptSegment, Transcription, WindowTranscription,
     transcribe_window_samples, transcription_windows,
@@ -158,7 +157,6 @@ pub fn transcribe_file_parallel_with_options<S: WhisperSpec + Send + 'static>(
     audio_path: &str,
     tokenizer_path: &str,
     model_paths: &ParallelModelPaths,
-    vad: Option<&VadModel>,
     options: &TranscribeOptions,
 ) -> Result<Transcription> {
     let lib = find_rknn_library()
@@ -167,7 +165,7 @@ pub fn transcribe_file_parallel_with_options<S: WhisperSpec + Send + 'static>(
     let tokenizer = Tokenizer::from_file(tokenizer_path)
         .map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
     let audio = load_audio_file(audio_path)?;
-    transcribe_audio_parallel_with_options::<S>(&audio, tokenizer, &lib, model_paths, vad, options)
+    transcribe_audio_parallel_with_options::<S>(&audio, tokenizer, &lib, model_paths, options)
 }
 
 /// Transcribe in-memory audio using three RK3588 NPU workers coordinated by Tokio.
@@ -176,11 +174,10 @@ pub fn transcribe_audio_parallel_with_options<S: WhisperSpec + Send + 'static>(
     tokenizer: Tokenizer,
     lib: &Path,
     model_paths: &ParallelModelPaths,
-    vad: Option<&VadModel>,
     options: &TranscribeOptions,
 ) -> Result<Transcription> {
     let mut pool = ParallelTranscriberPool::<S>::new(lib, model_paths)?;
-    pool.transcribe_audio_with_options(audio, Arc::new(tokenizer), vad, options)
+    pool.transcribe_audio_with_options(audio, Arc::new(tokenizer), options)
 }
 
 pub struct ParallelTranscriberPool<S: WhisperSpec + Send + 'static> {
@@ -230,34 +227,28 @@ impl<S: WhisperSpec + Send + 'static> ParallelTranscriberPool<S> {
         &mut self,
         audio: &[f32],
         tokenizer: Arc<Tokenizer>,
-        vad: Option<&VadModel>,
         options: &TranscribeOptions,
     ) -> Result<Transcription> {
-        self.transcribe_audio_with_segment_callback(audio, tokenizer, vad, options, |_| Ok(()))
+        self.transcribe_audio_with_segment_callback(audio, tokenizer, &[], options, |_| Ok(()))
     }
 
     pub fn transcribe_audio_with_segment_callback<F>(
         &mut self,
         audio: &[f32],
         tokenizer: Arc<Tokenizer>,
-        vad: Option<&VadModel>,
+        vad_segments: &[crate::vad::VadSegment],
         options: &TranscribeOptions,
         on_segment: F,
     ) -> Result<Transcription>
     where
         F: FnMut(&TranscriptSegment) -> Result<()>,
     {
-        let vad_segments = if let Some(vad) = vad {
-            vad.segments(audio)?
-        } else {
-            Vec::new()
-        };
-        let windows = transcription_windows(audio.len(), &vad_segments);
+        let windows = transcription_windows(audio.len(), vad_segments);
         if windows.is_empty() {
             return Ok(Transcription {
                 text: String::new(),
                 segments: Vec::new(),
-                vad_segments,
+                vad_segments: vad_segments.to_vec(),
             });
         }
 
@@ -272,11 +263,16 @@ impl<S: WhisperSpec + Send + 'static> ParallelTranscriberPool<S> {
         let ready_rx = &mut self.ready_rx;
         let result_rx = &mut self.result_rx;
 
+        let vad_segments_vec = vad_segments.to_vec();
         self.runtime.block_on(async {
             let dispatched =
                 dispatch_windows(windows, worker_txs, ready_rx, audio, tokenizer, options);
-            let collected =
-                collect_ordered_with_callback(result_rx, total_windows, vad_segments, on_segment);
+            let collected = collect_ordered_with_callback(
+                result_rx,
+                total_windows,
+                vad_segments_vec,
+                on_segment,
+            );
             let (_, transcription) = tokio::try_join!(dispatched, collected)?;
             Ok(transcription)
         })
