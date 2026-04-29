@@ -15,7 +15,7 @@ use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg}
 
 pub const FRAME_MAX_BYTES: usize = 1024 * 1024;
 pub const RING_HEADER_BYTES: usize = 32;
-pub const RING_DATA_BYTES: usize = SAMPLE_RATE as usize * 2 * 30;
+pub const RING_DATA_BYTES: usize = SAMPLE_RATE as usize * 2 * 120;
 pub const RING_MAGIC: u32 = 0x5257_4853; // RWHS
 pub const RING_VERSION: u32 = 1;
 

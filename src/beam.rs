@@ -131,9 +131,10 @@ impl<S: WhisperSpec> BeamSearch<S> {
 
         for cand in candidates.into_iter().take(self.size) {
             let mut tokens = cand.parent_tokens;
+            let prev_eot = tokens.last() == Some(&S::TOKEN_EOT);
             tokens.push(cand.token_id);
 
-            let mut finished = cand.token_id == S::TOKEN_EOT;
+            let mut finished = cand.token_id == S::TOKEN_EOT && prev_eot;
 
             // Repetition check (4+4)
             if tokens.len() >= 8 {

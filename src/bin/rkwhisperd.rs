@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use rknpu2::utils::find_rknn_library;
+use rknpu2::{RKNN, utils::find_rknn_library};
 use rkwhisper::{
     N_SAMPLES,
     daemon::{
@@ -18,6 +18,7 @@ use rkwhisper::{
         WhisperBase, WhisperLargeV3Turbo, WhisperMedium, WhisperSmall, WhisperSpec, WhisperTiny,
     },
     suppression::SuppressTokens,
+    vad::{VadConfig, VadModel},
     whisper::{TranscribeOptions, Transcription},
 };
 use std::collections::HashMap;
@@ -156,7 +157,12 @@ fn handle_connection(
         .context("failed to clone stream for live reader")?;
     let mut writer = BufWriter::new(stream);
     let started = Instant::now();
-    let fail_fast_windows = header.mode == "stream";
+
+    if header.mode == "batch" {
+        return handle_batch_connection(&mut writer, reader, ring, schedulers, header, started);
+    }
+
+    let fail_fast_windows = true;
     let (window_tx, window_rx) =
         mpsc::channel::<Result<LiveWindow>>(concurrency.client_window_queue_depth);
     let (response_tx, response_rx) =
@@ -201,6 +207,96 @@ fn handle_connection(
                     }
                 };
                 write_final_response(&mut writer, started, read_result, result)?;
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_batch_connection(
+    writer: &mut BufWriter<UnixStream>,
+    mut reader_stream: UnixStream,
+    ring: SharedAudioRing,
+    schedulers: ModelSchedulers,
+    header: RequestHeader,
+    started: Instant,
+) -> Result<()> {
+    let mut pcm = Vec::<u8>::new();
+    loop {
+        let mut signal = [0u8; 1];
+        let n = reader_stream
+            .read(&mut signal)
+            .context("failed to read shared-memory signal")?;
+        if n == 0 {
+            break;
+        }
+        match signal[0] {
+            SIGNAL_DATA_READY => {
+                ring.drain_available(&mut pcm)?;
+            }
+            SIGNAL_END_OF_STREAM => {
+                ring.drain_available(&mut pcm)?;
+                break;
+            }
+            SIGNAL_CANCEL => return Ok(()),
+            _ => {}
+        }
+    }
+
+    let audio = pcm_s16le_to_f32(&pcm)?;
+    let audio_s = rkwhisper::daemon::audio_seconds(audio.len());
+
+    let (response_tx, response_rx) = std_mpsc::sync_channel::<JobResponse>(128);
+
+    if let Err(error) = schedulers.submit_batch(header.clone(), audio, response_tx) {
+        let response = match error {
+            SubmitError::QueueFull(reason) => Response::BackOff {
+                reason,
+                retry_after_ms: 250,
+            },
+            SubmitError::UnknownModel => Response::Error {
+                error: "model not found".to_string(),
+            },
+            SubmitError::SchedulerStopped(reason) => Response::Error { error: reason },
+        };
+        write_response(writer, response)?;
+        return Ok(());
+    }
+
+    while let Ok(response) = response_rx.recv() {
+        match response {
+            JobResponse::Segment { text, begin, end } => {
+                write_response(writer, Response::Segment { text, begin, end })?;
+            }
+            JobResponse::Finished(result) => {
+                match result {
+                    Ok(stats) => {
+                        eprintln!(
+                            "batch completed: dispatched={} completed={}",
+                            stats.windows_dispatched, stats.windows_completed
+                        );
+                        write_response(
+                            writer,
+                            Response::Done {
+                                audio_s,
+                                rtf: rkwhisper::daemon::real_time_factor(
+                                    started.elapsed(),
+                                    audio_s,
+                                ),
+                            },
+                        )?;
+                    }
+                    Err(error) => {
+                        write_response(
+                            writer,
+                            Response::Error {
+                                error: error.to_string(),
+                            },
+                        )?;
+                    }
+                }
                 return Ok(());
             }
         }
@@ -425,16 +521,22 @@ impl ReadOutcome {
     }
 }
 
-#[derive(Debug)]
 enum JobResponse {
     Segment { text: String, begin: f32, end: f32 },
     Finished(Result<LiveTranscriptionStats>),
 }
 
-struct ModelJob {
-    header: RequestHeader,
-    window_rx: mpsc::Receiver<Result<LiveWindow>>,
-    response_tx: std_mpsc::SyncSender<JobResponse>,
+enum ModelJob {
+    Live {
+        header: RequestHeader,
+        window_rx: mpsc::Receiver<Result<LiveWindow>>,
+        response_tx: std_mpsc::SyncSender<JobResponse>,
+    },
+    Batch {
+        header: RequestHeader,
+        audio: Vec<f32>,
+        response_tx: std_mpsc::SyncSender<JobResponse>,
+    },
 }
 
 #[derive(Clone)]
@@ -478,9 +580,33 @@ impl ModelSchedulers {
             .get(&header.model)
             .ok_or(SubmitError::UnknownModel)?;
         job_tx
-            .try_send(ModelJob {
+            .try_send(ModelJob::Live {
                 header,
                 window_rx,
+                response_tx,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => SubmitError::QueueFull("model queue full".to_string()),
+                TrySendError::Closed(_) => {
+                    SubmitError::SchedulerStopped("model scheduler stopped".to_string())
+                }
+            })
+    }
+
+    fn submit_batch(
+        &self,
+        header: RequestHeader,
+        audio: Vec<f32>,
+        response_tx: std_mpsc::SyncSender<JobResponse>,
+    ) -> Result<(), SubmitError> {
+        let job_tx = self
+            .schedulers
+            .get(&header.model)
+            .ok_or(SubmitError::UnknownModel)?;
+        job_tx
+            .try_send(ModelJob::Batch {
+                header,
+                audio,
                 response_tx,
             })
             .map_err(|error| match error {
@@ -508,28 +634,60 @@ fn spawn_model_scheduler(
         .name(format!("rkwhisper-scheduler-{model_id}"))
         .spawn(move || {
             while let Some(job) = job_rx.blocking_recv() {
-                let response_tx = job.response_tx;
-                let segment_tx = response_tx.clone();
-                let result = pool
-                    .transcribe_live_stream(&job.header, job.window_rx, |segment| {
-                        segment_tx
-                            .try_send(JobResponse::Segment {
-                                text: segment.text.clone(),
-                                begin: segment.start_sec,
-                                end: segment.end_sec,
-                            })
-                            .map_err(|error| match error {
-                                std_mpsc::TrySendError::Full(_) => {
-                                    anyhow::anyhow!("client response queue full")
-                                }
-                                std_mpsc::TrySendError::Disconnected(_) => {
-                                    anyhow::anyhow!("client response channel closed")
-                                }
-                            })?;
-                        Ok(())
-                    })
-                    .map(|(_transcription, stats)| stats);
-                let _ = response_tx.send(JobResponse::Finished(result));
+                match job {
+                    ModelJob::Live {
+                        header,
+                        window_rx,
+                        response_tx,
+                    } => {
+                        let segment_tx = response_tx.clone();
+                        let result = pool.transcribe_live_stream(&header, window_rx, |segment| {
+                            segment_tx
+                                .try_send(JobResponse::Segment {
+                                    text: segment.text.clone(),
+                                    begin: segment.start_sec,
+                                    end: segment.end_sec,
+                                })
+                                .map_err(|error| match error {
+                                    std_mpsc::TrySendError::Full(_) => {
+                                        anyhow::anyhow!("client response queue full")
+                                    }
+                                    std_mpsc::TrySendError::Disconnected(_) => {
+                                        anyhow::anyhow!("client response channel closed")
+                                    }
+                                })?;
+                            Ok(())
+                        });
+                        let result = result.map(|(_transcription, stats)| stats);
+                        let _ = response_tx.send(JobResponse::Finished(result));
+                    }
+                    ModelJob::Batch {
+                        header,
+                        audio,
+                        response_tx,
+                    } => {
+                        let segment_tx = response_tx.clone();
+                        let result = pool.transcribe_batch(&header, &audio, |segment| {
+                            segment_tx
+                                .try_send(JobResponse::Segment {
+                                    text: segment.text.clone(),
+                                    begin: segment.start_sec,
+                                    end: segment.end_sec,
+                                })
+                                .map_err(|error| match error {
+                                    std_mpsc::TrySendError::Full(_) => {
+                                        anyhow::anyhow!("client response queue full")
+                                    }
+                                    std_mpsc::TrySendError::Disconnected(_) => {
+                                        anyhow::anyhow!("client response channel closed")
+                                    }
+                                })?;
+                            Ok(())
+                        });
+                        let result = result.map(|(_transcription, stats)| stats);
+                        let _ = response_tx.send(JobResponse::Finished(result));
+                    }
+                }
             }
         })
         .context("failed to spawn model scheduler")?;
@@ -605,9 +763,28 @@ impl ModelPool {
             Self::LargeV3Turbo(pool) => pool.transcribe_live_stream(header, window_rx, on_segment),
         }
     }
+
+    fn transcribe_batch<F>(
+        &mut self,
+        header: &RequestHeader,
+        audio: &[f32],
+        on_segment: F,
+    ) -> Result<(Transcription, LiveTranscriptionStats)>
+    where
+        F: FnMut(&rkwhisper::whisper::TranscriptSegment) -> Result<()>,
+    {
+        match self {
+            Self::Tiny(pool) => pool.transcribe_batch(header, audio, on_segment),
+            Self::Base(pool) => pool.transcribe_batch(header, audio, on_segment),
+            Self::Small(pool) => pool.transcribe_batch(header, audio, on_segment),
+            Self::Medium(pool) => pool.transcribe_batch(header, audio, on_segment),
+            Self::LargeV3Turbo(pool) => pool.transcribe_batch(header, audio, on_segment),
+        }
+    }
 }
 
 struct TypedModelPool<S: WhisperSpec + Send + 'static> {
+    files: ModelFiles,
     tokenizer: Arc<Tokenizer>,
     pool: ParallelTranscriberPool<S>,
 }
@@ -624,6 +801,7 @@ impl<S: WhisperSpec + Send + 'static> TypedModelPool<S> {
         );
         let pool = ParallelTranscriberPool::<S>::new(lib, &model_paths)?;
         Ok(Self {
+            files,
             tokenizer: Arc::new(tokenizer),
             pool,
         })
@@ -653,6 +831,60 @@ impl<S: WhisperSpec + Send + 'static> TypedModelPool<S> {
             &options,
             on_segment,
         )
+    }
+
+    fn transcribe_batch<F>(
+        &mut self,
+        header: &RequestHeader,
+        audio: &[f32],
+        on_segment: F,
+    ) -> Result<(Transcription, LiveTranscriptionStats)>
+    where
+        F: FnMut(&rkwhisper::whisper::TranscriptSegment) -> Result<()>,
+    {
+        let lib = find_rknn_library()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Could not find rknn library"))?;
+        let vad = if let Some(path) = &self.files.vad {
+            let config = VadConfig {
+                threshold: header.vad_threshold.unwrap_or(0.5),
+                min_speech_ms: header.vad_min_speech_ms.unwrap_or(250),
+                min_silence_ms: header.vad_min_silence_ms.unwrap_or(100),
+                speech_pad_ms: header.vad_speech_pad_ms.unwrap_or(200),
+                window_samples: header.vad_window_samples.unwrap_or(512),
+            };
+            Some(VadModel::new(
+                RKNN::new_with_library(&lib, &mut std::fs::read(path)?, 0)?,
+                config,
+            ))
+        } else {
+            None
+        };
+
+        let options = TranscribeOptions::new(
+            header.lang.clone(),
+            header.task.clone(),
+            header.notimestamps,
+            header.max_new_tokens,
+            header.beam_size,
+            SuppressTokens::parse(&header.suppress_tokens)?,
+        );
+
+        let transcription = self.pool.transcribe_audio_with_segment_callback(
+            audio,
+            self.tokenizer.clone(),
+            vad.as_ref(),
+            &options,
+            on_segment,
+        )?;
+
+        // Approximate stats for batch
+        let stats = LiveTranscriptionStats {
+            windows_dispatched: (audio.len() + 480000 - 1) / 480000,
+            windows_completed: (audio.len() + 480000 - 1) / 480000,
+        };
+
+        Ok((transcription, stats))
     }
 }
 

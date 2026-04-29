@@ -148,6 +148,7 @@ def setup_shared_ring(sock: socket.socket, stream, hello: dict) -> dict:
         "mmap": mapping,
         "capacity": response["ring_capacity_bytes"],
         "header_bytes": response["ring_header_bytes"],
+        "write_offset": 0,
     }
 
 
@@ -182,10 +183,17 @@ def write_ring_chunk(sock: socket.socket, ring: dict, pcm: bytes) -> None:
     mapping = ring["mmap"]
     capacity = ring["capacity"]
     header_bytes = ring["header_bytes"]
+
+    if header_bytes < 32:
+        raise SystemExit(f"Invalid header_bytes {header_bytes}; would overwrite ring metadata")
+
     written = 0
     while written < len(pcm):
+        # Read the daemon's read offset from the shared header (at offset 24)
         read = struct.unpack_from("<Q", mapping, 24)[0]
-        write = struct.unpack_from("<Q", mapping, 16)[0]
+        # Use our local write offset instead of reading it from shmem
+        write = ring["write_offset"]
+
         used = write - read
         if used >= capacity:
             time.sleep(0.005)
@@ -194,14 +202,42 @@ def write_ring_chunk(sock: socket.socket, ring: dict, pcm: bytes) -> None:
         free = capacity - used
         count = min(free, len(pcm) - written)
         pos = write % capacity
+
+        # 1. Write audio data to the ring buffer
         first = min(count, capacity - pos)
         mapping[header_bytes + pos : header_bytes + pos + first] = pcm[written : written + first]
         if count > first:
             mapping[header_bytes : header_bytes + count - first] = pcm[
                 written + first : written + count
             ]
+
+        # 2. Memory barrier (Release semantics): ensure audio is visible before index update.
+        # Note: mapping.flush() often requires page-aligned offsets on Linux.
+        page_size = mmap.PAGESIZE
+        
+        def flush_range(start, length):
+            if length <= 0:
+                return
+            m_size = len(mapping)
+            # Align start to page boundary
+            p_start = (start // page_size) * page_size
+            # Align end to page boundary, but clip to mapping size
+            p_end = min(((start + length + page_size - 1) // page_size) * page_size, m_size)
+            
+            if p_end > p_start:
+                mapping.flush(p_start, p_end - p_start)
+
+        flush_range(header_bytes + pos, first)
+        if count > first:
+            flush_range(header_bytes, count - first)
+
+        # 3. Commit the write by updating the absolute write index in shmem
         struct.pack_into("<Q", mapping, 16, write + count)
+        # Update our local tracking offset
+        ring["write_offset"] = write + count
+
         written += count
+        # 4. Notify the daemon that new data is available
         sock.sendall(SIGNAL_DATA_READY)
 
 
