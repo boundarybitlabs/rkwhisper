@@ -148,6 +148,7 @@ def setup_shared_ring(sock: socket.socket, stream, hello: dict) -> dict:
         "mmap": mapping,
         "capacity": response["ring_capacity_bytes"],
         "header_bytes": response["ring_header_bytes"],
+        "write_offset": 0,
     }
 
 
@@ -182,10 +183,17 @@ def write_ring_chunk(sock: socket.socket, ring: dict, pcm: bytes) -> None:
     mapping = ring["mmap"]
     capacity = ring["capacity"]
     header_bytes = ring["header_bytes"]
+
+    if header_bytes < 32:
+        raise SystemExit(f"Invalid header_bytes {header_bytes}; would overwrite ring metadata")
+
     written = 0
     while written < len(pcm):
+        # Read the daemon's read offset from the shared header (at offset 24)
         read = struct.unpack_from("<Q", mapping, 24)[0]
-        write = struct.unpack_from("<Q", mapping, 16)[0]
+        # Use our local write offset instead of reading it from shmem
+        write = ring["write_offset"]
+
         used = write - read
         if used >= capacity:
             time.sleep(0.005)
@@ -194,14 +202,42 @@ def write_ring_chunk(sock: socket.socket, ring: dict, pcm: bytes) -> None:
         free = capacity - used
         count = min(free, len(pcm) - written)
         pos = write % capacity
+
+        # 1. Write audio data to the ring buffer
         first = min(count, capacity - pos)
         mapping[header_bytes + pos : header_bytes + pos + first] = pcm[written : written + first]
         if count > first:
             mapping[header_bytes : header_bytes + count - first] = pcm[
                 written + first : written + count
             ]
+
+        # 2. Memory barrier (Release semantics): ensure audio is visible before index update.
+        # Note: mapping.flush() often requires page-aligned offsets on Linux.
+        page_size = mmap.PAGESIZE
+        
+        def flush_range(start, length):
+            if length <= 0:
+                return
+            m_size = len(mapping)
+            # Align start to page boundary
+            p_start = (start // page_size) * page_size
+            # Align end to page boundary, but clip to mapping size
+            p_end = min(((start + length + page_size - 1) // page_size) * page_size, m_size)
+            
+            if p_end > p_start:
+                mapping.flush(p_start, p_end - p_start)
+
+        flush_range(header_bytes + pos, first)
+        if count > first:
+            flush_range(header_bytes, count - first)
+
+        # 3. Commit the write by updating the absolute write index in shmem
         struct.pack_into("<Q", mapping, 16, write + count)
+        # Update our local tracking offset
+        ring["write_offset"] = write + count
+
         written += count
+        # 4. Notify the daemon that new data is available
         sock.sendall(SIGNAL_DATA_READY)
 
 
@@ -254,6 +290,15 @@ def read_responses_file(stream, text_only: bool, transcript_parts: list[str], st
         elif msg_type == "error":
             print(message.get("error", "daemon error"), file=sys.stderr)
             status["code"] = 1
+            return
+        elif msg_type == "cancelled":
+            if not text_only:
+                print(message, flush=True)
+            status["code"] = 130
+            return
+        elif msg_type == "back_off":
+            print(message.get("reason", "daemon busy"), file=sys.stderr)
+            status["code"] = 75
             return
         else:
             print(message, flush=True)
@@ -321,6 +366,10 @@ def decode_response(body: bytes) -> dict:
             return decode_done(value)
         if field == 4 and wire == 2:
             return decode_error(value)
+        if field == 5 and wire == 2:
+            return decode_cancelled(value)
+        if field == 6 and wire == 2:
+            return decode_back_off(value)
     return {"type": "unknown"}
 
 
@@ -361,6 +410,36 @@ def decode_error(body: bytes) -> dict:
     for field, wire, value in iter_fields(body):
         if field == 1 and wire == 2:
             response["error"] = value.decode("utf-8")
+    return response
+
+
+def decode_cancelled(body: bytes) -> dict:
+    response = {
+        "type": "cancelled",
+        "audio_s": 0.0,
+        "rtf": 0.0,
+        "windows_dispatched": 0,
+        "windows_completed": 0,
+    }
+    for field, wire, value in iter_fields(body):
+        if field == 1 and wire == 5:
+            response["audio_s"] = value
+        elif field == 2 and wire == 5:
+            response["rtf"] = value
+        elif field == 3 and wire == 0:
+            response["windows_dispatched"] = value
+        elif field == 4 and wire == 0:
+            response["windows_completed"] = value
+    return response
+
+
+def decode_back_off(body: bytes) -> dict:
+    response = {"type": "back_off", "reason": "daemon busy", "retry_after_ms": 0}
+    for field, wire, value in iter_fields(body):
+        if field == 1 and wire == 2:
+            response["reason"] = value.decode("utf-8")
+        elif field == 2 and wire == 0:
+            response["retry_after_ms"] = value
     return response
 
 

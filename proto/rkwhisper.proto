@@ -55,11 +55,25 @@ message Error {
   string error = 1;
 }
 
+message Cancelled {
+  float audio_s = 1;
+  float rtf = 2;
+  uint64 windows_dispatched = 3;
+  uint64 windows_completed = 4;
+}
+
+message BackOff {
+  string reason = 1;
+  uint32 retry_after_ms = 2;
+}
+
 message Response {
   oneof message {
     ServerHello server_hello = 1;
     Segment segment = 2;
     Done done = 3;
     Error error = 4;
+    Cancelled cancelled = 5;
+    BackOff back_off = 6;
   }
 }

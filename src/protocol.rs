@@ -15,7 +15,7 @@ use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg}
 
 pub const FRAME_MAX_BYTES: usize = 1024 * 1024;
 pub const RING_HEADER_BYTES: usize = 32;
-pub const RING_DATA_BYTES: usize = SAMPLE_RATE as usize * 2 * 30;
+pub const RING_DATA_BYTES: usize = SAMPLE_RATE as usize * 2 * 120;
 pub const RING_MAGIC: u32 = 0x5257_4853; // RWHS
 pub const RING_VERSION: u32 = 1;
 
@@ -82,9 +82,28 @@ pub struct ServerHello {
 #[derive(Clone, Debug)]
 pub enum Response {
     ServerHello(ServerHello),
-    Segment { text: String, begin: f32, end: f32 },
-    Done { audio_s: f32, rtf: f32 },
-    Error { error: String },
+    Segment {
+        text: String,
+        begin: f32,
+        end: f32,
+    },
+    Done {
+        audio_s: f32,
+        rtf: f32,
+    },
+    Error {
+        error: String,
+    },
+    Cancelled {
+        audio_s: f32,
+        rtf: f32,
+        windows_dispatched: u64,
+        windows_completed: u64,
+    },
+    BackOff {
+        reason: String,
+        retry_after_ms: u32,
+    },
 }
 
 pub fn supported_audio_format() -> AudioFormat {
@@ -209,13 +228,16 @@ impl SharedAudioRing {
         Ok(())
     }
 
-    pub fn drain_available(&self, out: &mut Vec<u8>) {
+    pub fn drain_available(&self, out: &mut Vec<u8>) -> Result<()> {
         let read = self.read_offset();
         let write = self.write_offset();
-        if write <= read {
-            return;
+        if write.saturating_sub(read) > self.capacity as u64 {
+            bail!("shared-memory ring overrun");
         }
-        let available = ((write - read) as usize).min(self.capacity);
+        if write <= read {
+            return Ok(());
+        }
+        let available = (write - read) as usize;
         let start = (read as usize) % self.capacity;
         let first = available.min(self.capacity - start);
         out.extend_from_slice(self.data_slice(start, first));
@@ -223,6 +245,7 @@ impl SharedAudioRing {
             out.extend_from_slice(self.data_slice(0, available - first));
         }
         self.set_read_offset(write);
+        Ok(())
     }
 
     fn init_header(&self) {
@@ -266,6 +289,12 @@ impl SharedAudioRing {
         let bytes = value.to_le_bytes();
         unsafe { self.ptr.add(offset).copy_from(bytes.as_ptr(), bytes.len()) }
     }
+
+    #[cfg(test)]
+    fn set_test_offsets(&self, read: u64, write: u64) {
+        self.read_atomic().store(read, Ordering::Release);
+        self.write_atomic().store(write, Ordering::Release);
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -292,7 +321,9 @@ impl SharedAudioRing {
         bail!("shared-memory daemon protocol requires Linux or FreeBSD memfd support")
     }
 
-    pub fn drain_available(&self, _out: &mut Vec<u8>) {}
+    pub fn drain_available(&self, _out: &mut Vec<u8>) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub fn decode_client_hello(bytes: &[u8]) -> Result<ClientHello> {
@@ -373,6 +404,28 @@ fn encode_response(response: Response) -> Vec<u8> {
             let mut msg = Vec::new();
             field_string(&mut msg, 1, &error);
             field_message(&mut out, 4, &msg);
+        }
+        Response::Cancelled {
+            audio_s,
+            rtf,
+            windows_dispatched,
+            windows_completed,
+        } => {
+            let mut msg = Vec::new();
+            field_fixed32(&mut msg, 1, audio_s);
+            field_fixed32(&mut msg, 2, rtf);
+            field_varint(&mut msg, 3, windows_dispatched);
+            field_varint(&mut msg, 4, windows_completed);
+            field_message(&mut out, 5, &msg);
+        }
+        Response::BackOff {
+            reason,
+            retry_after_ms,
+        } => {
+            let mut msg = Vec::new();
+            field_string(&mut msg, 1, &reason);
+            field_varint(&mut msg, 2, retry_after_ms as u64);
+            field_message(&mut out, 6, &msg);
         }
     }
     out
@@ -545,5 +598,15 @@ mod tests {
         validate_client_hello(&hello).unwrap();
         hello.audio_format.sample_rate = 48_000;
         assert!(validate_client_hello(&hello).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn ring_reports_overrun() {
+        let ring = SharedAudioRing::create(8).unwrap();
+        ring.set_test_offsets(0, 9);
+        let mut out = Vec::new();
+        let error = ring.drain_available(&mut out).unwrap_err();
+        assert!(error.to_string().contains("shared-memory ring overrun"));
     }
 }

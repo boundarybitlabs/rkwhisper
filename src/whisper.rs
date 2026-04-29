@@ -247,7 +247,7 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
         options.notimestamps,
         &options.suppress_tokens,
     )?;
-    let suppress_fn = |gen_len: usize, logits: &mut [f32]| suppressor.apply(gen_len, logits);
+    let suppress_fn = |tokens: &[u32], logits: &mut [f32]| suppressor.apply(tokens, logits);
 
     let mut generated: Vec<u32>;
 
@@ -257,7 +257,7 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
             state.clone(),
             last_logits,
             prompt.clone(),
-            0.6,
+            1.0, // Alpha 1.0: standard length normalization for Whisper
         );
         for _ in 0..options.max_new_tokens {
             beam_search.step(decoder, &suppress_fn)?;
@@ -269,10 +269,11 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
     } else {
         generated = Vec::new();
         let mut current_logits = last_logits;
+        let mut tokens_with_prompt = prompt.clone();
 
         for _step in 0..options.max_new_tokens {
             let mut logits_1d = current_logits.clone();
-            suppress_fn(prompt_len + generated.len(), &mut logits_1d);
+            suppress_fn(&tokens_with_prompt, &mut logits_1d);
 
             let token_id = argmax_token(&logits_1d);
             if token_id == tok_eot {
@@ -280,6 +281,7 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
             }
 
             generated.push(token_id);
+            tokens_with_prompt.push(token_id);
 
             if generated.len() >= 8 {
                 let tail = &generated[generated.len() - 8..];
@@ -385,13 +387,15 @@ fn tokens_to_segments(
                 let start_sec = current_start.or(last_timestamp).unwrap_or(window_start_sec);
                 let end_sec = ts.max(start_sec);
                 let text = tokenizer.decode(&current_tokens, true).unwrap_or_default();
-                segments.push(TranscriptSegment {
-                    start_sec,
-                    end_sec,
-                    text,
-                    tokens: current_tokens.clone(),
-                    window_index,
-                });
+                if !text.trim().is_empty() {
+                    segments.push(TranscriptSegment {
+                        start_sec,
+                        end_sec,
+                        text,
+                        tokens: current_tokens.clone(),
+                        window_index,
+                    });
+                }
                 current_tokens.clear();
             }
             current_start = Some(ts);
@@ -423,13 +427,15 @@ fn tokens_to_segments(
             let text = tokenizer
                 .decode(&non_timestamp_tokens, true)
                 .unwrap_or_default();
-            segments.push(TranscriptSegment {
-                start_sec: window_start_sec,
-                end_sec: window_end_sec,
-                text,
-                tokens: non_timestamp_tokens,
-                window_index,
-            });
+            if !text.trim().is_empty() {
+                segments.push(TranscriptSegment {
+                    start_sec: window_start_sec,
+                    end_sec: window_end_sec,
+                    text,
+                    tokens: non_timestamp_tokens,
+                    window_index,
+                });
+            }
         }
     }
 
