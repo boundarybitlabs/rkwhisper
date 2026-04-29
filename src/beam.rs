@@ -81,7 +81,7 @@ impl<S: WhisperSpec> BeamSearch<S> {
     pub fn step(
         &mut self,
         decoder: &mut WhisperDecoder<S>,
-        suppress_tokens: &dyn Fn(usize, &mut [f32]),
+        suppress_tokens: &dyn Fn(&[u32], &mut [f32]),
     ) -> anyhow::Result<()> {
         let mut candidates = Vec::new();
 
@@ -94,7 +94,7 @@ impl<S: WhisperSpec> BeamSearch<S> {
             let mut logits = beam.last_logits.clone();
 
             // Apply suppression rules
-            suppress_tokens(beam.tokens.len(), &mut logits);
+            suppress_tokens(&beam.tokens, &mut logits);
 
             // Log-softmax
             let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
@@ -131,19 +131,9 @@ impl<S: WhisperSpec> BeamSearch<S> {
 
         for cand in candidates.into_iter().take(self.size) {
             let mut tokens = cand.parent_tokens;
-            let prev_eot = tokens.last() == Some(&S::TOKEN_EOT);
             tokens.push(cand.token_id);
 
-            let mut finished = cand.token_id == S::TOKEN_EOT && prev_eot;
-
-            // Repetition check (4+4)
-            if tokens.len() >= 8 {
-                let tail = &tokens[tokens.len() - 8..];
-                if tail[0..4] == tail[4..8] {
-                    finished = true;
-                }
-            }
-
+            let finished = cand.token_id == S::TOKEN_EOT;
             if finished {
                 self.finished_beams.push(Beam {
                     tokens,

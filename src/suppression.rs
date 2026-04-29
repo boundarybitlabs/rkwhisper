@@ -36,6 +36,7 @@ pub struct TokenSuppressor {
     eot: u32,
     sot: u32,
     notimestamps_id: u32,
+    timestamp_begin: u32,
     ids: HashSet<u32>,
 }
 
@@ -47,8 +48,9 @@ impl TokenSuppressor {
         mode: &SuppressTokens,
     ) -> Result<Self> {
         let eot = S::TOKEN_EOT;
-        let sot = token_id(tokenizer, "<|startoftranscript|>")?;
-        let notimestamps_id = token_id(tokenizer, "<|notimestamps|>")?;
+        let sot = S::TOKEN_SOT;
+        let notimestamps_id = S::TOKEN_NOTIMESTAMPS;
+        let timestamp_begin = S::TOKEN_TIMESTAMP_BEGIN;
         let mut ids = HashSet::new();
 
         match mode {
@@ -66,11 +68,13 @@ impl TokenSuppressor {
             eot,
             sot,
             notimestamps_id,
+            timestamp_begin,
             ids,
         })
     }
 
-    pub fn apply(&self, gen_len: usize, logits: &mut [f32]) {
+    pub fn apply(&self, tokens: &[u32], logits: &mut [f32]) {
+        let gen_len = tokens.len();
         if gen_len <= self.prompt_len {
             suppress_id(logits, self.eot);
         }
@@ -88,13 +92,31 @@ impl TokenSuppressor {
                 logits[i] = -1e4;
             }
         }
-    }
-}
 
-fn token_id(tokenizer: &Tokenizer, token: &str) -> Result<u32> {
-    tokenizer
-        .token_to_id(token)
-        .ok_or_else(|| anyhow!("tokenizer is missing required token {token:?}"))
+        // Prevent consecutive timestamps
+        if let Some(&last) = tokens.last() {
+            if last >= self.timestamp_begin {
+                for i in (self.timestamp_begin as usize)..logits.len() {
+                    logits[i] = -1e4;
+                }
+            }
+        }
+
+        // Standard repetition penalty for text tokens (not timestamps, not special)
+        // We track seen tokens to apply the penalty only once per unique token.
+        let mut seen = HashSet::new();
+        for &id in tokens.iter().skip(self.prompt_len) {
+            if id < self.sot && seen.insert(id) {
+                if let Some(logit) = logits.get_mut(id as usize) {
+                    if *logit > 0.0 {
+                        *logit /= 1.1; // Slightly milder penalty
+                    } else {
+                        *logit *= 1.1;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn insert_if_present(tokenizer: &Tokenizer, ids: &mut HashSet<u32>, token: &str) {

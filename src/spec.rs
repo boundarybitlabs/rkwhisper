@@ -16,6 +16,9 @@ pub trait WhisperSpec {
     // Tokens
     const VOCAB: usize;
     const TOKEN_EOT: u32;
+    const TOKEN_SOT: u32 = 50258;
+    const TOKEN_NOTIMESTAMPS: u32 = 50363;
+    const TOKEN_TIMESTAMP_BEGIN: u32 = 50364;
 }
 
 pub struct WhisperTiny;
