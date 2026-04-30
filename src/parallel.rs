@@ -72,13 +72,14 @@ impl ModelBytes {
 }
 
 #[derive(Clone)]
-struct Job {
-    window_index: usize,
-    start_sample: usize,
-    end_sample: usize,
-    samples: Arc<[f32]>,
-    tokenizer: Arc<Tokenizer>,
-    options: Arc<TranscribeOptions>,
+pub struct WhisperJob {
+    pub window_index: usize,
+    pub absolute_start_sec: f32,
+    pub start_sample: usize,
+    pub end_sample: usize,
+    pub samples: Arc<[f32]>,
+    pub tokenizer: Arc<Tokenizer>,
+    pub options: Arc<TranscribeOptions>,
 }
 
 pub struct LiveWindow {
@@ -95,12 +96,12 @@ pub struct LiveTranscriptionStats {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Ready {
-    worker_id: usize,
+pub struct Ready {
+    pub worker_id: usize,
 }
 
 struct Worker {
-    job_tx: mpsc::Sender<Job>,
+    job_tx: mpsc::Sender<WhisperJob>,
     join: Option<JoinHandle<Result<()>>>,
 }
 
@@ -126,7 +127,7 @@ impl<S: WhisperSpec> PipelineCtx<S> {
         })
     }
 
-    fn transcribe_window(&self, job: Job) -> Result<WindowTranscription> {
+    fn transcribe_window(&self, job: WhisperJob) -> Result<WindowTranscription> {
         let mut decoder = WhisperDecoder::<S>::new(&self.decoder_rknn);
         transcribe_window_samples(
             &job.samples,
@@ -136,6 +137,7 @@ impl<S: WhisperSpec> PipelineCtx<S> {
             &self.enc_kv,
             &mut decoder,
             job.window_index,
+            job.absolute_start_sec,
             job.start_sample,
             job.end_sample,
             &job.options,
@@ -182,8 +184,8 @@ pub fn transcribe_audio_parallel_with_options<S: WhisperSpec + Send + 'static>(
 
 pub struct ParallelTranscriberPool<S: WhisperSpec + Send + 'static> {
     workers: Vec<Worker>,
-    ready_rx: mpsc::Receiver<Ready>,
-    result_rx: mpsc::Receiver<Result<WindowTranscription>>,
+    pub ready_rx: mpsc::Receiver<Ready>,
+    pub result_rx: mpsc::Receiver<Result<WindowTranscription>>,
     runtime: tokio::runtime::Runtime,
     _spec: std::marker::PhantomData<S>,
 }
@@ -278,37 +280,8 @@ impl<S: WhisperSpec + Send + 'static> ParallelTranscriberPool<S> {
         })
     }
 
-    pub fn transcribe_live_windows_with_callback<F>(
-        &mut self,
-        mut window_rx: mpsc::Receiver<Result<LiveWindow>>,
-        tokenizer: Arc<Tokenizer>,
-        options: &TranscribeOptions,
-        on_segment: F,
-    ) -> Result<(Transcription, LiveTranscriptionStats)>
-    where
-        F: FnMut(&TranscriptSegment) -> Result<()>,
-    {
-        let options = Arc::new(options.clone());
-        let worker_txs = self
-            .workers
-            .iter()
-            .map(|worker| worker.job_tx.clone())
-            .collect::<Vec<_>>();
-        let ready_rx = &mut self.ready_rx;
-        let result_rx = &mut self.result_rx;
-
-        self.runtime.block_on(async {
-            transcribe_live_windows(
-                &mut window_rx,
-                worker_txs,
-                ready_rx,
-                result_rx,
-                tokenizer,
-                options,
-                on_segment,
-            )
-            .await
-        })
+    pub fn worker_txs(&self) -> Vec<mpsc::Sender<WhisperJob>> {
+        self.workers.iter().map(|w| w.job_tx.clone()).collect()
     }
 }
 
@@ -335,7 +308,7 @@ fn spawn_npu_worker<S: WhisperSpec + Send + 'static>(
     ready_tx: mpsc::Sender<Ready>,
     result_tx: mpsc::Sender<Result<WindowTranscription>>,
 ) -> Result<Worker> {
-    let (job_tx, mut job_rx) = mpsc::channel::<Job>(1);
+    let (job_tx, mut job_rx) = mpsc::channel::<WhisperJob>(1);
     let join = std::thread::Builder::new()
         .name(format!("rkwhisper-npu-{worker_id}"))
         .spawn(move || {
@@ -378,7 +351,7 @@ fn spawn_npu_worker<S: WhisperSpec + Send + 'static>(
 
 async fn dispatch_windows(
     windows: Vec<AudioWindow>,
-    worker_txs: Vec<mpsc::Sender<Job>>,
+    worker_txs: Vec<mpsc::Sender<WhisperJob>>,
     ready_rx: &mut mpsc::Receiver<Ready>,
     audio: Arc<[f32]>,
     tokenizer: Arc<Tokenizer>,
@@ -395,8 +368,9 @@ async fn dispatch_windows(
             .get(ready.worker_id)
             .ok_or_else(|| anyhow!("invalid worker id {}", ready.worker_id))?;
         worker_tx
-            .send(Job {
+            .send(WhisperJob {
                 window_index: window.index,
+                absolute_start_sec: crate::vad::samples_to_sec(window.start_sample),
                 start_sample: window.start_sample,
                 end_sample: window.end_sample,
                 samples: Arc::<[f32]>::from(audio[window.start_sample..window.end_sample].to_vec()),
@@ -408,96 +382,6 @@ async fn dispatch_windows(
     }
 
     Ok(())
-}
-
-async fn transcribe_live_windows<F>(
-    window_rx: &mut mpsc::Receiver<Result<LiveWindow>>,
-    worker_txs: Vec<mpsc::Sender<Job>>,
-    ready_rx: &mut mpsc::Receiver<Ready>,
-    result_rx: &mut mpsc::Receiver<Result<WindowTranscription>>,
-    tokenizer: Arc<Tokenizer>,
-    options: Arc<TranscribeOptions>,
-    mut on_segment: F,
-) -> Result<(Transcription, LiveTranscriptionStats)>
-where
-    F: FnMut(&TranscriptSegment) -> Result<()>,
-{
-    let mut producer_closed = false;
-    let mut pending_windows = VecDeque::<LiveWindow>::new();
-    let mut ready_workers = VecDeque::<usize>::new();
-    let mut pending_results = BTreeMap::<usize, WindowTranscription>::new();
-    let mut next_result = 0usize;
-    let mut in_flight = 0usize;
-    let mut full_text = String::new();
-    let mut segments = Vec::new();
-    let mut stats = LiveTranscriptionStats::default();
-
-    loop {
-        while !ready_workers.is_empty() && !pending_windows.is_empty() {
-            let worker_id = ready_workers.pop_front().unwrap();
-            let window = pending_windows.pop_front().unwrap();
-            let worker_tx = worker_txs
-                .get(worker_id)
-                .ok_or_else(|| anyhow!("invalid worker id {worker_id}"))?;
-            worker_tx
-                .send(Job {
-                    window_index: window.index,
-                    start_sample: window.start_sample,
-                    end_sample: window.end_sample,
-                    samples: Arc::<[f32]>::from(window.samples),
-                    tokenizer: tokenizer.clone(),
-                    options: options.clone(),
-                })
-                .await
-                .map_err(|_| anyhow!("worker {worker_id} stopped before accepting a job"))?;
-            in_flight += 1;
-            stats.windows_dispatched += 1;
-        }
-
-        if producer_closed && pending_windows.is_empty() && in_flight == 0 {
-            break;
-        }
-
-        tokio::select! {
-            ready = ready_rx.recv(), if !producer_closed || !pending_windows.is_empty() => {
-                let ready = ready.ok_or_else(|| anyhow!("all NPU workers stopped"))?;
-                ready_workers.push_back(ready.worker_id);
-            }
-            window = window_rx.recv(), if !producer_closed => {
-                match window {
-                    Some(Ok(window)) => pending_windows.push_back(window),
-                    Some(Err(error)) => return Err(error),
-                    None => producer_closed = true,
-                }
-            }
-            result = result_rx.recv(), if in_flight > 0 => {
-                let result = result
-                    .ok_or_else(|| anyhow!("result channel closed before all windows completed"))??;
-                in_flight -= 1;
-                stats.windows_completed += 1;
-                pending_results.insert(result.window_index, result);
-
-                while let Some(result) = pending_results.remove(&next_result) {
-                    full_text.push_str(&result.text);
-                    full_text.push(' ');
-                    for segment in &result.segments {
-                        on_segment(segment)?;
-                    }
-                    segments.extend(result.segments);
-                    next_result += 1;
-                }
-            }
-        }
-    }
-
-    Ok((
-        Transcription {
-            text: full_text.trim().to_string(),
-            segments,
-            vad_segments: Vec::new(),
-        },
-        stats,
-    ))
 }
 
 async fn collect_ordered_with_callback<F>(
@@ -575,6 +459,7 @@ mod tests {
     fn window_result(window_index: usize, text: &str) -> WindowTranscription {
         WindowTranscription {
             window_index,
+            absolute_start_sec: 0.0,
             text: text.to_string(),
             segments: Vec::new(),
         }

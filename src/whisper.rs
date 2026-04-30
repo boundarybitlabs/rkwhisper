@@ -63,10 +63,11 @@ pub(crate) struct AudioWindow {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct WindowTranscription {
-    pub(crate) window_index: usize,
-    pub(crate) text: String,
-    pub(crate) segments: Vec<TranscriptSegment>,
+pub struct WindowTranscription {
+    pub window_index: usize,
+    pub absolute_start_sec: f32,
+    pub text: String,
+    pub segments: Vec<TranscriptSegment>,
 }
 
 /// Transcribe arbitrary-length WAV with chunked 30-second encoder windows.
@@ -148,8 +149,17 @@ pub fn transcribe_audio_with_options<S: WhisperSpec>(
     let mut segments = Vec::new();
 
     for window in &windows {
+        let absolute_start_sec = samples_to_sec(window.start_sample);
         let result = transcribe_audio_window(
-            audio, tokenizer, mel_spec, encoder, enc_kv, decoder, window, options,
+            audio,
+            tokenizer,
+            mel_spec,
+            encoder,
+            enc_kv,
+            decoder,
+            window,
+            absolute_start_sec,
+            options,
         )?;
         full_text.push_str(&result.text);
         full_text.push(' ');
@@ -182,6 +192,7 @@ pub(crate) fn transcribe_audio_window<S: WhisperSpec>(
     enc_kv: &EncKvModel<S>,
     decoder: &mut WhisperDecoder<S>,
     window: &AudioWindow,
+    absolute_start_sec: f32,
     options: &TranscribeOptions,
 ) -> Result<WindowTranscription> {
     let wave = &audio[window.start_sample..window.end_sample];
@@ -193,6 +204,7 @@ pub(crate) fn transcribe_audio_window<S: WhisperSpec>(
         enc_kv,
         decoder,
         window.index,
+        absolute_start_sec,
         window.start_sample,
         window.end_sample,
         options,
@@ -207,6 +219,7 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
     enc_kv: &EncKvModel<S>,
     decoder: &mut WhisperDecoder<S>,
     window_index: usize,
+    absolute_start_sec: f32,
     window_start_sample: usize,
     window_end_sample: usize,
     options: &TranscribeOptions,
@@ -309,13 +322,14 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
         tokenizer,
         output_tokens,
         window_index,
-        samples_to_sec(window_start_sample),
-        samples_to_sec(window_end_sample),
+        absolute_start_sec,
+        absolute_start_sec + samples_to_sec(window_end_sample - window_start_sample),
         tok_notimestamps + 1,
     );
 
     Ok(WindowTranscription {
         window_index,
+        absolute_start_sec,
         text,
         segments,
     })
