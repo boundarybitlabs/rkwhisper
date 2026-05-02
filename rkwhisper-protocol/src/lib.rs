@@ -215,6 +215,8 @@ pub struct SharedAudioRing {
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 unsafe impl Send for SharedAudioRing {}
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+unsafe impl Sync for SharedAudioRing {}
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 impl SharedAudioRing {

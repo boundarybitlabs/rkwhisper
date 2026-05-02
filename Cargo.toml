@@ -3,5 +3,6 @@ members = [
     "rkwhisper",
     "rkwhisper-protocol",
     "rkwhisper-client",
+    "rkwhisper-python",
 ]
 resolver = "2"
