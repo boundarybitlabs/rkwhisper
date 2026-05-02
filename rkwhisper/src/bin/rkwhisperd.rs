@@ -9,9 +9,8 @@ use rkwhisper::{
     },
     parallel::{LiveTranscriptionStats, ParallelModelPaths, ParallelTranscriberPool, WhisperJob},
     protocol::{
-        RING_DATA_BYTES, RING_HEADER_BYTES, Response, SIGNAL_CANCEL, SIGNAL_DATA_READY,
-        SIGNAL_END_OF_STREAM, ServerHello, SharedAudioRing, read_client_hello,
-        supported_audio_format, validate_client_hello, write_response,
+        RING_DATA_BYTES, Response, SIGNAL_CANCEL, SIGNAL_DATA_READY, SIGNAL_END_OF_STREAM,
+        ServerHello, SharedAudioRing, read_client_hello, validate_client_hello, write_response,
     },
     spec::{
         WhisperBase, WhisperLargeV3Turbo, WhisperMedium, WhisperSmall, WhisperSpec, WhisperTiny,
@@ -119,36 +118,37 @@ fn handle_connection(
     let hello = match read_client_hello(&mut stream) {
         Ok(hello) => hello,
         Err(error) => {
-            write_error(&mut stream, &error.to_string())?;
+            write_error(&stream, &error.to_string())?;
             return Ok(());
         }
     };
     if let Err(error) = validate_client_hello(&hello) {
-        write_error(&mut stream, &error.to_string())?;
+        write_error(&stream, &error.to_string())?;
         return Ok(());
     }
 
     let header = request_header_from_hello(hello);
     if !schedulers.contains_model(&header.model) {
-        write_error(&mut stream, "model not found")?;
+        write_error(&stream, "model not found")?;
         return Ok(());
     }
 
     let ring = match SharedAudioRing::create(RING_DATA_BYTES) {
         Ok(ring) => ring,
         Err(error) => {
-            write_error(&mut stream, &error.to_string())?;
+            write_error(&stream, &error.to_string())?;
             return Ok(());
         }
     };
-    ring.send_fd(&stream)?;
-    write_response(
-        &mut stream,
+
+    rkwhisper::protocol::send_response_with_fd(
+        &stream,
         Response::ServerHello(ServerHello {
-            audio_format: supported_audio_format(),
+            audio_format: rkwhisper::protocol::supported_audio_format(),
             ring_capacity_bytes: ring.capacity() as u64,
-            ring_header_bytes: RING_HEADER_BYTES as u32,
+            ring_header_bytes: rkwhisper::protocol::RING_HEADER_BYTES as u32,
         }),
+        Some(ring.fd()),
     )?;
 
     let reader = stream
@@ -186,14 +186,12 @@ fn handle_connection(
         .spawn(move || read_live_chunks(reader, ring, window_tx))
         .context("failed to spawn live stream reader")?;
 
-    let mut job_finished = false;
     while let Ok(response) = response_rx.recv() {
         match response {
             JobResponse::Segment { text, begin, end } => {
                 write_response(&mut writer, Response::Segment { text, begin, end })?;
             }
             JobResponse::Finished(result) => {
-                job_finished = true;
                 let read_result = match reader.join() {
                     Ok(result) => result,
                     Err(_) => {
@@ -210,10 +208,6 @@ fn handle_connection(
                 return Ok(());
             }
         }
-    }
-
-    if !job_finished {
-        write_error(&mut writer.into_inner()?, "model scheduler thread exited unexpectedly")?;
     }
 
     Ok(())
@@ -833,12 +827,13 @@ fn spawn_model_scheduler(
     Ok(())
 }
 
-fn write_error(stream: &mut UnixStream, error: &str) -> Result<()> {
-    write_response(
+fn write_error(stream: &UnixStream, error: &str) -> Result<()> {
+    rkwhisper::protocol::send_response_with_fd(
         stream,
         Response::Error {
             error: error.to_string(),
         },
+        None,
     )
 }
 

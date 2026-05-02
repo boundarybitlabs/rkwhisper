@@ -168,6 +168,71 @@ pub fn write_frame(writer: &mut impl Write, frame: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub fn send_response_with_fd(
+    stream: &UnixStream,
+    response: Response,
+    fd: Option<&OwnedFd>,
+) -> Result<()> {
+    let frame = encode_response(response);
+    if frame.len() > FRAME_MAX_BYTES {
+        bail!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes");
+    }
+
+    let len_bytes = (frame.len() as u32).to_le_bytes();
+    let iov = [IoSlice::new(&len_bytes), IoSlice::new(&frame)];
+
+    if let Some(fd) = fd {
+        let fds = [fd.as_fd()];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        control.push(SendAncillaryMessage::ScmRights(&fds));
+        sendmsg(stream, &iov, &mut control, SendFlags::empty())
+            .context("failed to send response with fd")?;
+    } else {
+        let mut control = SendAncillaryBuffer::new(&mut []);
+        sendmsg(stream, &iov, &mut control, SendFlags::empty())
+            .context("failed to send response without fd")?;
+    }
+
+    Ok(())
+}
+
+pub fn recv_response_with_fd(stream: &UnixStream) -> Result<(Response, Option<OwnedFd>)> {
+    let mut len_bytes = [0u8; 4];
+    let mut iov = [rustix::io::IoSliceMut::new(&mut len_bytes)];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+
+    let msg = recvmsg(stream, &mut iov, &mut control, rustix::net::RecvFlags::empty())
+        .context("failed to receive response header and ancillary data")?;
+
+    if msg.bytes != 4 {
+        bail!("failed to receive full response frame length");
+    }
+
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > FRAME_MAX_BYTES {
+        bail!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes");
+    }
+
+    let mut body = vec![0u8; len];
+    let mut body_reader = stream;
+    body_reader
+        .read_exact(&mut body)
+        .context("failed to read response frame body")?;
+
+    let response = decode_response(&body)?;
+    let mut received_fd = None;
+
+    for cmsg in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(fds) = cmsg {
+            received_fd = fds.map(|fd| fd.try_clone()).next().transpose()?;
+        }
+    }
+
+    Ok((response, received_fd))
+}
+
 #[cfg(feature = "async")]
 pub async fn read_frame_async(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
@@ -267,6 +332,10 @@ impl SharedAudioRing {
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    pub fn fd(&self) -> &OwnedFd {
+        &self.fd
     }
 
     pub fn send_fd(&self, stream: &UnixStream) -> Result<()> {

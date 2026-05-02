@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, anyhow};
 use rkwhisper_protocol::{
     decode_response, encode_client_hello, ClientHello, Response, SharedAudioRing,
     SIGNAL_CANCEL, SIGNAL_DATA_READY, SIGNAL_END_OF_STREAM,
@@ -23,19 +23,17 @@ pub mod sync {
             let encoded_hello = encode_client_hello(&hello);
             rkwhisper_protocol::write_frame(&mut stream, &encoded_hello)?;
 
-            // 2. Receive FD
-            let fd = SharedAudioRing::recv_fd(&stream)?;
-
-            // 3. Receive ServerHello
-            let frame = rkwhisper_protocol::read_frame(&mut stream)?;
-            let response = decode_response(&frame)?;
+            // 2. Receive Response and potential FD
+            let (response, fd) = rkwhisper_protocol::recv_response_with_fd(&stream)?;
             let server_hello = match response {
                 Response::ServerHello(sh) => sh,
                 Response::Error { error } => bail!("server error during handshake: {error}"),
                 other => bail!("unexpected response during handshake: {other:?}"),
             };
 
-            // 4. Attach to ring
+            let fd = fd.ok_or_else(|| anyhow!("no file descriptor received during handshake"))?;
+
+            // 3. Attach to ring
             let ring = SharedAudioRing::attach(fd, server_hello.ring_capacity_bytes as usize)?;
 
             Ok(Self { stream, ring })
@@ -92,19 +90,28 @@ pub mod asynchronous {
             let encoded_hello = encode_client_hello(&hello);
             rkwhisper_protocol::write_frame_async(&mut stream, &encoded_hello).await?;
 
-            // 2. Receive FD
-            let (fd, mut stream) = recv_fd_async(stream).await?;
+            // 2. Receive Response and potential FD (switch to std for recvmsg)
+            let (response, fd, stream) = tokio::task::spawn_blocking(move || {
+                let std_stream = stream.into_std()?;
+                std_stream.set_nonblocking(false)?;
+                let (response, fd) = rkwhisper_protocol::recv_response_with_fd(&std_stream)?;
+                std_stream.set_nonblocking(true)?;
+                let stream = UnixStream::from_std(std_stream)?;
+                Ok::<(Response, Option<std::os::fd::OwnedFd>, UnixStream), anyhow::Error>((
+                    response, fd, stream,
+                ))
+            })
+            .await??;
 
-            // 3. Receive ServerHello
-            let frame = rkwhisper_protocol::read_frame_async(&mut stream).await?;
-            let response = decode_response(&frame)?;
             let server_hello = match response {
                 Response::ServerHello(sh) => sh,
                 Response::Error { error } => bail!("server error during handshake: {error}"),
                 other => bail!("unexpected response during handshake: {other:?}"),
             };
 
-            // 4. Attach to ring
+            let fd = fd.ok_or_else(|| anyhow!("no file descriptor received during handshake"))?;
+
+            // 3. Attach to ring
             let ring = SharedAudioRing::attach(fd, server_hello.ring_capacity_bytes as usize)?;
 
             Ok(Self { stream, ring })
@@ -139,14 +146,5 @@ pub mod asynchronous {
             let frame = rkwhisper_protocol::read_frame_async(&mut self.stream).await?;
             decode_response(&frame)
         }
-    }
-
-    async fn recv_fd_async(stream: UnixStream) -> Result<(std::os::fd::OwnedFd, UnixStream)> {
-        let std_stream = stream.into_std()?;
-        std_stream.set_nonblocking(false)?;
-        let fd = SharedAudioRing::recv_fd(&std_stream)?;
-        std_stream.set_nonblocking(true)?;
-        let stream = UnixStream::from_std(std_stream)?;
-        Ok((fd, stream))
     }
 }
