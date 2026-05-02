@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
 use rkwhisper_protocol::{ClientHello, AudioFormat, VadOptions, SAMPLE_RATE};
 
-#[pyclass]
+#[pyclass(name = "AudioFormat")]
 #[derive(Clone)]
 pub struct PyAudioFormat {
     #[pyo3(get, set)]
@@ -26,7 +26,7 @@ impl PyAudioFormat {
     }
 }
 
-#[pyclass]
+#[pyclass(name = "VadOptions")]
 #[derive(Clone)]
 pub struct PyVadOptions {
     #[pyo3(get, set)]
@@ -62,7 +62,7 @@ impl PyVadOptions {
     }
 }
 
-#[pyclass]
+#[pyclass(name = "ClientHello")]
 pub struct PyClientHello {
     #[pyo3(get, set)]
     pub model: String,

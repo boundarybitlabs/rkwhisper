@@ -186,12 +186,14 @@ fn handle_connection(
         .spawn(move || read_live_chunks(reader, ring, window_tx))
         .context("failed to spawn live stream reader")?;
 
+    let mut job_finished = false;
     while let Ok(response) = response_rx.recv() {
         match response {
             JobResponse::Segment { text, begin, end } => {
                 write_response(&mut writer, Response::Segment { text, begin, end })?;
             }
             JobResponse::Finished(result) => {
+                job_finished = true;
                 let read_result = match reader.join() {
                     Ok(result) => result,
                     Err(_) => {
@@ -208,6 +210,10 @@ fn handle_connection(
                 return Ok(());
             }
         }
+    }
+
+    if !job_finished {
+        write_error(&mut writer.into_inner()?, "model scheduler thread exited unexpectedly")?;
     }
 
     Ok(())
