@@ -52,18 +52,29 @@ impl VadModel {
         let mut state = vec![0.0f32; 2 * 128];
         for start in (0..audio.len()).step_by(self.config.window_samples) {
             let end = (start + self.config.window_samples).min(audio.len());
-            let mut window = vec![0.0f32; self.config.window_samples];
-            window[..end - start].copy_from_slice(&audio[start..end]);
-            probs.push((start, self.speech_probability(&window, &mut state)?));
+            probs.push((
+                start,
+                self.speech_probability(&audio[start..end], &mut state)?,
+            ));
         }
         Ok(segments_from_probs(audio.len(), &probs, &self.config))
     }
 
-    fn speech_probability(&self, window: &[f32], state: &mut [f32]) -> Result<f32> {
+    pub fn speech_probability(&self, window: &[f32], state: &mut [f32]) -> Result<f32> {
+        let mut padded_window;
+        let window_to_use = if window.len() != self.config.window_samples {
+            padded_window = vec![0.0f32; self.config.window_samples];
+            let len = window.len().min(self.config.window_samples);
+            padded_window[..len].copy_from_slice(&window[..len]);
+            &padded_window
+        } else {
+            window
+        };
+
         self.rknn.set_inputs(vec![
             Input {
                 index: 0,
-                buffer: BufView::F32(window),
+                buffer: BufView::F32(window_to_use),
                 pass_through: false,
                 fmt: TensorFormatKind::UNDEFINED(TensorFormat::UNDEFINED),
             },
@@ -97,6 +108,28 @@ impl VadModel {
         self.rknn.get_outputs(&mut outputs)?;
         state.copy_from_slice(&next_state);
         Ok(prob[0])
+    }
+}
+
+pub struct StreamingVad {
+    state: Vec<f32>,
+    config: VadConfig,
+}
+
+impl StreamingVad {
+    pub fn new(config: VadConfig) -> Self {
+        Self {
+            state: vec![0.0f32; 2 * 128],
+            config,
+        }
+    }
+
+    pub fn config(&self) -> &VadConfig {
+        &self.config
+    }
+
+    pub fn process_window(&mut self, model: &VadModel, window: &[f32]) -> Result<f32> {
+        model.speech_probability(window, &mut self.state)
     }
 }
 
