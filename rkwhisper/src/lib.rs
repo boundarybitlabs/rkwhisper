@@ -15,14 +15,14 @@ pub mod daemon;
 pub mod decoder;
 pub mod encoder;
 pub mod parallel;
-pub mod protocol;
+pub use rkwhisper_protocol as protocol;
 pub mod spec;
 pub mod suppression;
 pub mod vad;
 pub mod whisper;
 
+pub const SAMPLE_RATE: u32 = protocol::SAMPLE_RATE;
 pub const N_SAMPLES: usize = SAMPLE_RATE as usize * 30;
-pub const SAMPLE_RATE: u32 = 16_000;
 pub const N_FFT: usize = 400;
 pub const HOP_LENGTH: usize = 160;
 pub const N_MELS: usize = 80;

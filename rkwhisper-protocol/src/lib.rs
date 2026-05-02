@@ -1,4 +1,4 @@
-use crate::SAMPLE_RATE;
+pub const SAMPLE_RATE: u32 = 16_000;
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::{IoSlice, Read, Write};
 use std::mem::MaybeUninit;
@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
-use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
+use rustix::net::{
+    RecvAncillaryBuffer, RecvAncillaryMessage, SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
+    recvmsg, sendmsg,
+};
 
 pub const FRAME_MAX_BYTES: usize = 1024 * 1024;
 pub const RING_HEADER_BYTES: usize = 32;
@@ -165,6 +168,43 @@ pub fn write_frame(writer: &mut impl Write, frame: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "async")]
+pub async fn read_frame_async(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut len = [0u8; 4];
+    reader
+        .read_exact(&mut len)
+        .await
+        .context("failed to read protobuf frame length")?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len > FRAME_MAX_BYTES {
+        bail!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes");
+    }
+    let mut frame = vec![0u8; len];
+    reader
+        .read_exact(&mut frame)
+        .await
+        .context("failed to read protobuf frame body")?;
+    Ok(frame)
+}
+
+#[cfg(feature = "async")]
+pub async fn write_frame_async(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    frame: &[u8],
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    if frame.len() > FRAME_MAX_BYTES {
+        bail!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes");
+    }
+    writer.write_all(&(frame.len() as u32).to_le_bytes()).await?;
+    writer.write_all(frame).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub struct SharedAudioRing {
     fd: OwnedFd,
@@ -185,6 +225,15 @@ impl SharedAudioRing {
         let fd = memfd_create("rkwhisper-audio", MemfdFlags::CLOEXEC)
             .context("failed to create audio memfd")?;
         ftruncate(&fd, len as u64).context("failed to size audio memfd")?;
+        let ring = Self::attach(fd, capacity)?;
+        ring.init_header();
+        Ok(ring)
+    }
+
+    pub fn attach(fd: OwnedFd, capacity: usize) -> Result<Self> {
+        let len = RING_HEADER_BYTES
+            .checked_add(capacity)
+            .ok_or_else(|| anyhow!("ring size overflow"))?;
         let ptr = unsafe {
             mmap(
                 null_mut(),
@@ -197,14 +246,21 @@ impl SharedAudioRing {
         }
         .context("failed to map audio memfd")? as *mut u8;
 
-        let ring = Self {
+        Ok(Self {
             fd,
             ptr,
             len,
             capacity,
-        };
-        ring.init_header();
-        Ok(ring)
+        })
+    }
+
+    pub fn init_header(&self) {
+        self.write_u32(0, RING_MAGIC);
+        self.write_u32(4, RING_VERSION);
+        self.capacity_atomic()
+            .store(self.capacity as u64, Ordering::Release);
+        self.write_atomic().store(0, Ordering::Release);
+        self.read_atomic().store(0, Ordering::Release);
     }
 
     pub fn capacity(&self) -> usize {
@@ -228,6 +284,33 @@ impl SharedAudioRing {
         Ok(())
     }
 
+    pub fn recv_fd(stream: &UnixStream) -> Result<OwnedFd> {
+
+        let mut byte = [0u8; 1];
+        let mut iov = [rustix::io::IoSliceMut::new(&mut byte)];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+
+        let msg = recvmsg(stream, &mut iov, &mut control, rustix::net::RecvFlags::empty())
+            .context("failed to receive audio memfd")?;
+
+        if msg.bytes != 1 {
+            bail!("failed to receive audio memfd marker byte");
+        }
+
+        for cmsg in control.drain() {
+            if let RecvAncillaryMessage::ScmRights(fds) = cmsg {
+                return fds
+                    .map(|fd| fd.try_clone())
+                    .next()
+                    .transpose()?
+                    .ok_or_else(|| anyhow!("no file descriptor received"));
+            }
+        }
+
+        bail!("no file descriptor received in ancillary data");
+    }
+
     pub fn drain_available(&self, out: &mut Vec<u8>) -> Result<()> {
         let read = self.read_offset();
         let write = self.write_offset();
@@ -248,13 +331,34 @@ impl SharedAudioRing {
         Ok(())
     }
 
-    fn init_header(&self) {
-        self.write_u32(0, RING_MAGIC);
-        self.write_u32(4, RING_VERSION);
-        self.capacity_atomic()
-            .store(self.capacity as u64, Ordering::Release);
-        self.write_atomic().store(0, Ordering::Release);
-        self.read_atomic().store(0, Ordering::Release);
+    pub fn push_available(&self, data: &[u8]) -> Result<usize> {
+        let read = self.read_offset();
+        let write = self.write_offset();
+        if write.saturating_sub(read) > self.capacity as u64 {
+            bail!("shared-memory ring overrun");
+        }
+        let available = self.capacity - (write - read) as usize;
+        let to_write = data.len().min(available);
+        if to_write == 0 {
+            return Ok(0);
+        }
+
+        let start = (write as usize) % self.capacity;
+        let first = to_write.min(self.capacity - start);
+        self.write_data_slice(start, &data[..first]);
+        if to_write > first {
+            self.write_data_slice(0, &data[first..to_write]);
+        }
+        self.set_write_offset(write + to_write as u64);
+        Ok(to_write)
+    }
+
+    fn write_data_slice(&self, offset: usize, data: &[u8]) {
+        unsafe {
+            self.ptr
+                .add(RING_HEADER_BYTES + offset)
+                .copy_from_nonoverlapping(data.as_ptr(), data.len())
+        }
     }
 
     fn read_offset(&self) -> u64 {
@@ -267,6 +371,10 @@ impl SharedAudioRing {
 
     fn write_offset(&self) -> u64 {
         self.write_atomic().load(Ordering::Acquire)
+    }
+
+    fn set_write_offset(&self, value: u64) {
+        self.write_atomic().store(value, Ordering::Release);
     }
 
     fn capacity_atomic(&self) -> &AtomicU64 {
@@ -445,6 +553,167 @@ fn encode_audio_format(format: &AudioFormat) -> Vec<u8> {
     field_varint(&mut out, 2, format.channels as u64);
     field_varint(&mut out, 3, format.sample_format as u64);
     out
+}
+
+pub fn encode_client_hello(hello: &ClientHello) -> Vec<u8> {
+    let mut out = Vec::new();
+    field_string(&mut out, 1, &hello.model);
+    field_string(&mut out, 2, &hello.mode);
+    field_string(&mut out, 3, &hello.lang);
+    field_string(&mut out, 4, &hello.task);
+    field_varint(&mut out, 5, hello.max_new_tokens as u64);
+    field_varint(&mut out, 6, hello.beam_size as u64);
+    field_varint(&mut out, 7, if hello.notimestamps { 1 } else { 0 });
+    field_string(&mut out, 8, &hello.suppress_tokens);
+    field_message(&mut out, 9, &encode_audio_format(&hello.audio_format));
+    field_message(&mut out, 10, &encode_vad_options(&hello.vad));
+    out
+}
+
+fn encode_vad_options(vad: &VadOptions) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some(threshold) = vad.threshold {
+        field_fixed32(&mut out, 1, threshold);
+    }
+    if let Some(min_speech_ms) = vad.min_speech_ms {
+        field_varint(&mut out, 2, min_speech_ms as u64);
+    }
+    if let Some(min_silence_ms) = vad.min_silence_ms {
+        field_varint(&mut out, 3, min_silence_ms as u64);
+    }
+    if let Some(speech_pad_ms) = vad.speech_pad_ms {
+        field_varint(&mut out, 4, speech_pad_ms as u64);
+    }
+    if let Some(window_samples) = vad.window_samples {
+        field_varint(&mut out, 5, window_samples as u64);
+    }
+    out
+}
+
+pub fn decode_response(bytes: &[u8]) -> Result<Response> {
+    let mut input = ProtoInput::new(bytes);
+    let (field, wire) = input.key()?;
+    if wire != 2 {
+        bail!("invalid response wire type {wire}");
+    }
+    let body = input.bytes()?;
+    match field {
+        1 => Ok(Response::ServerHello(decode_server_hello(body)?)),
+        2 => decode_segment(body),
+        3 => decode_done(body),
+        4 => Ok(Response::Error {
+            error: decode_error(body)?,
+        }),
+        5 => decode_cancelled(body),
+        6 => decode_back_off(body),
+        _ => bail!("unknown response field {field}"),
+    }
+}
+
+fn decode_server_hello(bytes: &[u8]) -> Result<ServerHello> {
+    let mut hello = ServerHello {
+        audio_format: AudioFormat::default(),
+        ring_capacity_bytes: 0,
+        ring_header_bytes: 0,
+    };
+    let mut input = ProtoInput::new(bytes);
+    while !input.is_empty() {
+        let (field, wire) = input.key()?;
+        match (field, wire) {
+            (1, 2) => hello.audio_format = decode_audio_format(input.bytes()?)?,
+            (2, 0) => hello.ring_capacity_bytes = input.varint()?,
+            (3, 0) => hello.ring_header_bytes = input.varint()? as u32,
+            (_, _) => input.skip(wire)?,
+        }
+    }
+    Ok(hello)
+}
+
+fn decode_segment(bytes: &[u8]) -> Result<Response> {
+    let mut text = String::new();
+    let mut begin = 0.0;
+    let mut end = 0.0;
+    let mut input = ProtoInput::new(bytes);
+    while !input.is_empty() {
+        let (field, wire) = input.key()?;
+        match (field, wire) {
+            (1, 2) => text = input.string()?,
+            (2, 5) => begin = input.fixed32()?,
+            (3, 5) => end = input.fixed32()?,
+            (_, _) => input.skip(wire)?,
+        }
+    }
+    Ok(Response::Segment { text, begin, end })
+}
+
+fn decode_done(bytes: &[u8]) -> Result<Response> {
+    let mut audio_s = 0.0;
+    let mut rtf = 0.0;
+    let mut input = ProtoInput::new(bytes);
+    while !input.is_empty() {
+        let (field, wire) = input.key()?;
+        match (field, wire) {
+            (1, 5) => audio_s = input.fixed32()?,
+            (2, 5) => rtf = input.fixed32()?,
+            (_, _) => input.skip(wire)?,
+        }
+    }
+    Ok(Response::Done { audio_s, rtf })
+}
+
+fn decode_error(bytes: &[u8]) -> Result<String> {
+    let mut input = ProtoInput::new(bytes);
+    let mut error = String::new();
+    while !input.is_empty() {
+        let (field, wire) = input.key()?;
+        match (field, wire) {
+            (1, 2) => error = input.string()?,
+            (_, _) => input.skip(wire)?,
+        }
+    }
+    Ok(error)
+}
+
+fn decode_cancelled(bytes: &[u8]) -> Result<Response> {
+    let mut audio_s = 0.0;
+    let mut rtf = 0.0;
+    let mut windows_dispatched = 0;
+    let mut windows_completed = 0;
+    let mut input = ProtoInput::new(bytes);
+    while !input.is_empty() {
+        let (field, wire) = input.key()?;
+        match (field, wire) {
+            (1, 5) => audio_s = input.fixed32()?,
+            (2, 5) => rtf = input.fixed32()?,
+            (3, 0) => windows_dispatched = input.varint()?,
+            (4, 0) => windows_completed = input.varint()?,
+            (_, _) => input.skip(wire)?,
+        }
+    }
+    Ok(Response::Cancelled {
+        audio_s,
+        rtf,
+        windows_dispatched,
+        windows_completed,
+    })
+}
+
+fn decode_back_off(bytes: &[u8]) -> Result<Response> {
+    let mut reason = String::new();
+    let mut retry_after_ms = 0;
+    let mut input = ProtoInput::new(bytes);
+    while !input.is_empty() {
+        let (field, wire) = input.key()?;
+        match (field, wire) {
+            (1, 2) => reason = input.string()?,
+            (2, 0) => retry_after_ms = input.varint()? as u32,
+            (_, _) => input.skip(wire)?,
+        }
+    }
+    Ok(Response::BackOff {
+        reason,
+        retry_after_ms,
+    })
 }
 
 fn field_varint(out: &mut Vec<u8>, field: u32, value: u64) {
