@@ -887,18 +887,6 @@ impl ModelPool {
         Ok((pool, vad))
     }
 
-    fn transcribe_batch<F>(
-        &mut self,
-        header: &RequestHeader,
-        audio: &[f32],
-        on_segment: F,
-    ) -> Result<(Transcription, LiveTranscriptionStats)>
-    where
-        F: FnMut(&rkwhisper::whisper::TranscriptSegment) -> Result<()>,
-    {
-        self.transcribe_batch_with_vad(header, audio, &[], on_segment)
-    }
-
     fn transcribe_batch_with_vad<F>(
         &mut self,
         header: &RequestHeader,
