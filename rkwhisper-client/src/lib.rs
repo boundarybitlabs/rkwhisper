@@ -57,26 +57,45 @@ pub mod sync {
 
     impl Session {
         pub fn connect(socket_path: impl AsRef<Path>, hello: ClientHello) -> Result<Self> {
-            let mut stream = UnixStream::connect(socket_path).map_err(Error::Connection)?;
+            let mut retries = 0;
+            let max_retries = 5;
 
-            // 1. Send ClientHello
-            let encoded_hello = encode_client_hello(&hello);
-            rkwhisper_protocol::write_frame(&mut stream, &encoded_hello)?;
+            loop {
+                let mut stream = UnixStream::connect(socket_path.as_ref()).map_err(Error::Connection)?;
 
-            // 2. Receive Response and potential FD
-            let (response, fd) = rkwhisper_protocol::recv_response_with_fd(&stream)?;
-            let server_hello = match response {
-                Response::ServerHello(sh) => sh,
-                Response::Error { error } => return Err(Error::Handshake(error)),
-                other => return Err(Error::Handshake(format!("unexpected response: {other:?}"))),
-            };
+                // 1. Send ClientHello
+                let encoded_hello = encode_client_hello(&hello);
+                rkwhisper_protocol::write_frame(&mut stream, &encoded_hello)?;
 
-            let fd = fd.ok_or_else(|| Error::Handshake("no file descriptor received".to_string()))?;
-
-            // 3. Attach to ring
-            let ring = SharedAudioRing::attach(fd, server_hello.ring_capacity_bytes as usize)?;
-
-            Ok(Self { stream, ring })
+                // 2. Receive Response and potential FD
+                let (response, fd) = rkwhisper_protocol::recv_response_with_fd(&stream)?;
+                match response {
+                    Response::ServerHello(sh) => {
+                        let fd = fd.ok_or_else(|| {
+                            Error::Handshake("no file descriptor received".to_string())
+                        })?;
+                        let ring = SharedAudioRing::attach(fd, sh.ring_capacity_bytes as usize)?;
+                        return Ok(Self { stream, ring });
+                    }
+                    Response::BackOff {
+                        reason,
+                        retry_after_ms,
+                    } => {
+                        if retries >= max_retries {
+                            return Err(Error::Handshake(format!(
+                                "too many retries after backoff: {reason}"
+                            )));
+                        }
+                        retries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(retry_after_ms as u64));
+                        continue;
+                    }
+                    Response::Error { error } => return Err(Error::Handshake(error)),
+                    other => {
+                        return Err(Error::Handshake(format!("unexpected response: {other:?}")))
+                    }
+                }
+            }
         }
 
         pub fn send_audio(&mut self, pcm: &[u8]) -> Result<()> {
@@ -163,38 +182,62 @@ pub mod asynchronous {
 
     impl Session {
         pub async fn connect(socket_path: impl AsRef<Path>, hello: ClientHello) -> Result<Self> {
-            let mut stream = UnixStream::connect(socket_path).await.map_err(Error::Connection)?;
+            let mut retries = 0;
+            let max_retries = 5;
 
-            // 1. Send ClientHello
-            let encoded_hello = encode_client_hello(&hello);
-            rkwhisper_protocol::write_frame_async(&mut stream, &encoded_hello).await?;
+            loop {
+                let mut stream = UnixStream::connect(socket_path.as_ref())
+                    .await
+                    .map_err(Error::Connection)?;
 
-            // 2. Receive Response and potential FD (switch to std for recvmsg)
-            let (response, fd, stream) = tokio::task::spawn_blocking(move || {
-                let std_stream = stream.into_std().map_err(Error::Connection)?;
-                std_stream.set_nonblocking(false).map_err(Error::Connection)?;
-                let (response, fd) = rkwhisper_protocol::recv_response_with_fd(&std_stream)?;
-                std_stream.set_nonblocking(true).map_err(Error::Connection)?;
-                let stream = UnixStream::from_std(std_stream).map_err(Error::Connection)?;
-                Ok::<(Response, Option<std::os::fd::OwnedFd>, UnixStream), Error>((
-                    response, fd, stream,
-                ))
-            })
-            .await
-            .map_err(|e| Error::Other(e.to_string()))??;
+                // 1. Send ClientHello
+                let encoded_hello = encode_client_hello(&hello);
+                rkwhisper_protocol::write_frame_async(&mut stream, &encoded_hello).await?;
 
-            let server_hello = match response {
-                Response::ServerHello(sh) => sh,
-                Response::Error { error } => return Err(Error::Handshake(error)),
-                other => return Err(Error::Handshake(format!("unexpected response: {other:?}"))),
-            };
+                // 2. Receive Response and potential FD (switch to std for recvmsg)
+                let (response, fd, stream_back) = tokio::task::spawn_blocking(move || {
+                    let std_stream = stream.into_std().map_err(Error::Connection)?;
+                    std_stream.set_nonblocking(false).map_err(Error::Connection)?;
+                    let (response, fd) = rkwhisper_protocol::recv_response_with_fd(&std_stream)?;
+                    std_stream.set_nonblocking(true).map_err(Error::Connection)?;
+                    let stream = UnixStream::from_std(std_stream).map_err(Error::Connection)?;
+                    Ok::<(Response, Option<std::os::fd::OwnedFd>, UnixStream), Error>((
+                        response, fd, stream,
+                    ))
+                })
+                .await
+                .map_err(|e| Error::Other(e.to_string()))??;
 
-            let fd = fd.ok_or_else(|| Error::Handshake("no file descriptor received".to_string()))?;
+                stream = stream_back;
 
-            // 3. Attach to ring
-            let ring = SharedAudioRing::attach(fd, server_hello.ring_capacity_bytes as usize)?;
-
-            Ok(Self { stream, ring })
+                match response {
+                    Response::ServerHello(sh) => {
+                        let fd = fd.ok_or_else(|| {
+                            Error::Handshake("no file descriptor received".to_string())
+                        })?;
+                        let ring = SharedAudioRing::attach(fd, sh.ring_capacity_bytes as usize)?;
+                        return Ok(Self { stream, ring });
+                    }
+                    Response::BackOff {
+                        reason,
+                        retry_after_ms,
+                    } => {
+                        if retries >= max_retries {
+                            return Err(Error::Handshake(format!(
+                                "too many retries after backoff: {reason}"
+                            )));
+                        }
+                        retries += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms as u64))
+                            .await;
+                        continue;
+                    }
+                    Response::Error { error } => return Err(Error::Handshake(error)),
+                    other => {
+                        return Err(Error::Handshake(format!("unexpected response: {other:?}")))
+                    }
+                }
+            }
         }
 
         pub async fn send_audio(&mut self, pcm: &[u8]) -> Result<()> {

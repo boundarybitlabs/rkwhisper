@@ -7,6 +7,7 @@ from .rkwhisper_client import (
     SpeechEnded,
     Done,
     SyncSession,
+    AsyncSession,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "SpeechEnded",
     "Done",
     "SyncSession",
+    "AsyncSession",
 ]
