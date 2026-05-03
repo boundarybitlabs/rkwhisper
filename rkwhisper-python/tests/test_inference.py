@@ -29,14 +29,25 @@ def test_transcribe_audio(session):
     session.finish()
 
     results = []
-    while True:
-        segment = session.recv_response()
-        if segment is None:  # Done
-            break
-        results.append(segment)
+    speech_started = False
+    speech_ended = False
+
+    from rkwhisper_client import Segment, SpeechStarted, SpeechEnded
+
+    for resp in session:
+        if isinstance(resp, Segment):
+            results.append(resp.text)
+        elif isinstance(resp, SpeechStarted):
+            speech_started = True
+        elif isinstance(resp, SpeechEnded):
+            speech_ended = True
 
     full_text = " ".join(results).lower()
     print(f"Transcribed text: {full_text}")
 
     # Check that we got some non-empty transcription
     assert len(full_text.strip()) > 0
+    # verify speech events were received (assuming the audio has speech)
+    assert speech_started
+    assert speech_ended
+

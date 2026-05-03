@@ -9,8 +9,7 @@ TEST_MODEL = os.getenv("RKWHISPER_TEST_MODEL", "whisper-small-30s")
 @pytest.fixture
 def client_hello():
     """Default ClientHello for testing."""
-    return ClientHello(model=TEST_MODEL)
-
+    return ClientHello(model=TEST_MODEL, client_id="pytest-integration")
 
 @pytest.fixture
 def session_factory():
@@ -19,10 +18,11 @@ def session_factory():
 
     def _create(hello=None):
         if hello is None:
-            hello = ClientHello(model=TEST_MODEL)
+            hello = ClientHello(model=TEST_MODEL, client_id="pytest-integration")
         s = SyncSession.connect(SOCKET_PATH, hello)
         sessions.append(s)
         return s
+
 
     yield _create
 

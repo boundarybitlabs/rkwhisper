@@ -1,5 +1,21 @@
-from .rkwhisper_client import *
+from .rkwhisper_client import (
+    AudioFormat,
+    VadOptions,
+    ClientHello,
+    Segment,
+    SpeechStarted,
+    SpeechEnded,
+    Done,
+    SyncSession,
+)
 
-__doc__ = rkwhisper_client.__doc__
-if hasattr(rkwhisper_client, "__all__"):
-    __all__ = rkwhisper_client.__all__
+__all__ = [
+    "AudioFormat",
+    "VadOptions",
+    "ClientHello",
+    "Segment",
+    "SpeechStarted",
+    "SpeechEnded",
+    "Done",
+    "SyncSession",
+]
