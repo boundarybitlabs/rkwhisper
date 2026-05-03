@@ -1,5 +1,10 @@
+import pytest
 import wave
+import os
 from pathlib import Path
+from rkwhisper_client import ClientHello
+
+TEST_MODEL = os.getenv("RKWHISPER_TEST_MODEL", "whisper-small-30s")
 
 FIXTURES_DIR = Path(__file__).parent.parent.parent / "fixtures"
 WAV_PATH = next(FIXTURES_DIR.glob("*.wav"), None)

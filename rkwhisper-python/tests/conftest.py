@@ -29,7 +29,7 @@ def session_factory():
     for s in sessions:
         try:
             s.cancel()  # Best effort cleanup
-        except:
+        except Exception:
             pass
 
 
