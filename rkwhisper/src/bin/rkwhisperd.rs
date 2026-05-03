@@ -127,11 +127,17 @@ fn handle_connection(
         return Ok(());
     }
 
+    let client_id = hello.client_id.clone();
     let header = request_header_from_hello(hello);
     if !schedulers.contains_model(&header.model) {
         write_error(&stream, "model not found")?;
         return Ok(());
     }
+
+    eprintln!(
+        "session started: client_id={:?} model={} mode={}",
+        client_id, header.model, header.mode
+    );
 
     let ring = match SharedAudioRing::create(RING_DATA_BYTES) {
         Ok(ring) => ring,
@@ -186,12 +192,20 @@ fn handle_connection(
         .spawn(move || read_live_chunks(reader, ring, window_tx))
         .context("failed to spawn live stream reader")?;
 
+    let mut job_finished = false;
     while let Ok(response) = response_rx.recv() {
         match response {
             JobResponse::Segment { text, begin, end } => {
                 write_response(&mut writer, Response::Segment { text, begin, end })?;
             }
+            JobResponse::SpeechStarted { begin } => {
+                write_response(&mut writer, Response::SpeechStarted { begin })?;
+            }
+            JobResponse::SpeechEnded { end } => {
+                write_response(&mut writer, Response::SpeechEnded { end })?;
+            }
             JobResponse::Finished(result) => {
+                job_finished = true;
                 let read_result = match reader.join() {
                     Ok(result) => result,
                     Err(_) => {
@@ -201,13 +215,17 @@ fn handle_connection(
                                 error: "live stream reader thread panicked".to_string(),
                             },
                         )?;
-                        return Ok(());
+                        break;
                     }
                 };
                 write_final_response(&mut writer, started, read_result, result)?;
-                return Ok(());
+                break;
             }
         }
+    }
+
+    if !job_finished {
+        write_error(&mut writer.into_inner()?, "model scheduler thread exited unexpectedly")?;
     }
 
     Ok(())
@@ -267,6 +285,12 @@ fn handle_batch_connection(
         match response {
             JobResponse::Segment { text, begin, end } => {
                 write_response(writer, Response::Segment { text, begin, end })?;
+            }
+            JobResponse::SpeechStarted { begin } => {
+                write_response(writer, Response::SpeechStarted { begin })?;
+            }
+            JobResponse::SpeechEnded { end } => {
+                write_response(writer, Response::SpeechEnded { end })?;
             }
             JobResponse::Finished(result) => {
                 match result {
@@ -459,6 +483,8 @@ impl ReadOutcome {
 
 enum JobResponse {
     Segment { text: String, begin: f32, end: f32 },
+    SpeechStarted { begin: f32 },
+    SpeechEnded { end: f32 },
     Finished(Result<LiveTranscriptionStats>),
 }
 
@@ -597,6 +623,7 @@ fn spawn_model_scheduler(
                         let mut pending_results = BTreeMap::<usize, WindowTranscription>::new();
                         let mut next_result_index = 0usize;
                         let mut ready_workers = VecDeque::new();
+                        let mut speech_active = false;
 
                         let (pool_ready_rx, pool_result_rx, worker_txs, tokenizer) = match &mut pool {
                             ModelPool::Tiny(p) => {
@@ -712,6 +739,16 @@ fn spawn_model_scheduler(
                                             vad.config(),
                                         );
 
+                                        if !segments.is_empty() && !speech_active {
+                                            speech_active = true;
+                                            let begin = rkwhisper::vad::samples_to_sec(absolute_offset_samples + segments[0].start_sample);
+                                            let _ = response_tx.send(JobResponse::SpeechStarted { begin });
+                                        } else if segments.is_empty() && speech_active {
+                                            speech_active = false;
+                                            let end = rkwhisper::vad::samples_to_sec(absolute_offset_samples);
+                                            let _ = response_tx.send(JobResponse::SpeechEnded { end });
+                                        }
+
                                         if segments.is_empty() && producer_closed {
                                             // Stream closed and VAD found no more speech in buffer.
                                             // Drain the rest to allow exit.
@@ -795,6 +832,13 @@ fn spawn_model_scheduler(
                             Vec::new()
                         };
 
+                        for seg in &vad_segments {
+                            let _ = response_tx.send(JobResponse::SpeechStarted {
+                                begin: seg.start_sec,
+                            });
+                            let _ = response_tx.send(JobResponse::SpeechEnded { end: seg.end_sec });
+                        }
+
                         let result = pool.transcribe_batch_with_vad(
                             &header,
                             &audio,
@@ -834,7 +878,8 @@ fn write_error(stream: &UnixStream, error: &str) -> Result<()> {
             error: error.to_string(),
         },
         None,
-    )
+    )?;
+    Ok(())
 }
 
 fn request_header_from_hello(hello: rkwhisper::protocol::ClientHello) -> RequestHeader {

@@ -5,8 +5,17 @@ FIXTURES_DIR = Path(__file__).parent.parent.parent / "fixtures"
 WAV_PATH = next(FIXTURES_DIR.glob("*.wav"), None)
 
 
-def test_transcribe_audio(session):
+@pytest.fixture
+def stream_hello():
+    """ClientHello with streaming mode enabled."""
+    return ClientHello(
+        model=TEST_MODEL, client_id="pytest-stream", mode="stream"
+    )
+
+def test_transcribe_audio(session_factory, stream_hello):
     """End-to-end transcription test using a sample from fixtures."""
+    session = session_factory(stream_hello)
+    
     assert WAV_PATH is not None, f"No .wav fixtures found in {FIXTURES_DIR}"
     assert WAV_PATH.exists(), f"Test audio not found at {WAV_PATH}"
 
