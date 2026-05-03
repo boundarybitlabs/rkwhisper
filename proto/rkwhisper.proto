@@ -32,6 +32,7 @@ message ClientHello {
   string suppress_tokens = 8;
   AudioFormat audio_format = 9;
   VadOptions vad = 10;
+  string client_id = 11;
 }
 
 message ServerHello {
@@ -67,6 +68,16 @@ message BackOff {
   uint32 retry_after_ms = 2;
 }
 
+message SpeechEvent {
+  enum EventType {
+    SPEECH_EVENT_UNSPECIFIED = 0;
+    SPEECH_EVENT_STARTED = 1;
+    SPEECH_EVENT_ENDED = 2;
+  }
+  EventType type = 1;
+  float timestamp = 2;
+}
+
 message Response {
   oneof message {
     ServerHello server_hello = 1;
@@ -75,5 +86,6 @@ message Response {
     Error error = 4;
     Cancelled cancelled = 5;
     BackOff back_off = 6;
+    SpeechEvent speech_event = 7;
   }
 }
