@@ -663,6 +663,11 @@ fn spawn_model_scheduler(
                         rt.block_on(async {
                             loop {
                                 if producer_closed && audio_buffer.is_empty() && in_flight == 0 {
+                                    if speech_active {
+                                        speech_active = false;
+                                        let end = rkwhisper::vad::samples_to_sec(absolute_offset_samples);
+                                        let _ = response_tx.send(JobResponse::SpeechEnded { end });
+                                    }
                                     break;
                                 }
 
