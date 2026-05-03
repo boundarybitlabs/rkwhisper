@@ -1,11 +1,26 @@
 pub const SAMPLE_RATE: u32 = 16_000;
-use anyhow::{Context, Result, anyhow, bail};
 use std::io::{IoSlice, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("protobuf error: {0}")]
+    Proto(String),
+    #[error("ring buffer error: {0}")]
+    Ring(String),
+    #[error("invalid argument: {0}")]
+    Invalid(String),
+    #[error("other error: {0}")]
+    Other(String),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
@@ -56,6 +71,7 @@ pub struct ClientHello {
     pub suppress_tokens: String,
     pub audio_format: AudioFormat,
     pub vad: VadOptions,
+    pub client_id: String,
 }
 
 impl Default for ClientHello {
@@ -71,6 +87,7 @@ impl Default for ClientHello {
             suppress_tokens: "default".to_string(),
             audio_format: supported_audio_format(),
             vad: VadOptions::default(),
+            client_id: "rkwhisper-rust-client".to_string(),
         }
     }
 }
@@ -107,6 +124,12 @@ pub enum Response {
         reason: String,
         retry_after_ms: u32,
     },
+    SpeechStarted {
+        begin: f32,
+    },
+    SpeechEnded {
+        end: f32,
+    },
 }
 
 pub fn supported_audio_format() -> AudioFormat {
@@ -119,16 +142,16 @@ pub fn supported_audio_format() -> AudioFormat {
 
 pub fn validate_client_hello(hello: &ClientHello) -> Result<()> {
     if hello.mode != "batch" && hello.mode != "stream" {
-        bail!("unsupported mode {:?}", hello.mode);
+        return Err(Error::Invalid(format!("unsupported mode {:?}", hello.mode)));
     }
     if hello.beam_size == 0 {
-        bail!("beam_size must be at least 1");
+        return Err(Error::Invalid("beam_size must be at least 1".to_string()));
     }
     if hello.audio_format.sample_rate != SAMPLE_RATE
         || hello.audio_format.channels != 1
         || hello.audio_format.sample_format != SAMPLE_FORMAT_S16LE
     {
-        bail!("unsupported audio format; expected 16 kHz mono s16le");
+        return Err(Error::Invalid("unsupported audio format; expected 16 kHz mono s16le".to_string()));
     }
     Ok(())
 }
@@ -146,25 +169,25 @@ pub fn read_frame(reader: &mut impl Read) -> Result<Vec<u8>> {
     let mut len = [0u8; 4];
     reader
         .read_exact(&mut len)
-        .context("failed to read protobuf frame length")?;
+        .map_err(|e| Error::Io(e))?;
     let len = u32::from_le_bytes(len) as usize;
     if len > FRAME_MAX_BYTES {
-        bail!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes");
+        return Err(Error::Proto(format!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes")));
     }
     let mut frame = vec![0u8; len];
     reader
         .read_exact(&mut frame)
-        .context("failed to read protobuf frame body")?;
+        .map_err(|e| Error::Io(e))?;
     Ok(frame)
 }
 
 pub fn write_frame(writer: &mut impl Write, frame: &[u8]) -> Result<()> {
     if frame.len() > FRAME_MAX_BYTES {
-        bail!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes");
+        return Err(Error::Proto(format!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes")));
     }
-    writer.write_all(&(frame.len() as u32).to_le_bytes())?;
-    writer.write_all(frame)?;
-    writer.flush()?;
+    writer.write_all(&(frame.len() as u32).to_le_bytes()).map_err(|e| Error::Io(e))?;
+    writer.write_all(frame).map_err(|e| Error::Io(e))?;
+    writer.flush().map_err(|e| Error::Io(e))?;
     Ok(())
 }
 
@@ -175,7 +198,7 @@ pub fn send_response_with_fd(
 ) -> Result<()> {
     let frame = encode_response(response);
     if frame.len() > FRAME_MAX_BYTES {
-        bail!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes");
+        return Err(Error::Proto(format!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes")));
     }
 
     let len_bytes = (frame.len() as u32).to_le_bytes();
@@ -187,11 +210,11 @@ pub fn send_response_with_fd(
         let mut control = SendAncillaryBuffer::new(&mut space);
         control.push(SendAncillaryMessage::ScmRights(&fds));
         sendmsg(stream, &iov, &mut control, SendFlags::empty())
-            .context("failed to send response with fd")?;
+            .map_err(|e| Error::Io(e.into()))?;
     } else {
         let mut control = SendAncillaryBuffer::new(&mut []);
         sendmsg(stream, &iov, &mut control, SendFlags::empty())
-            .context("failed to send response without fd")?;
+            .map_err(|e| Error::Io(e.into()))?;
     }
 
     Ok(())
@@ -204,29 +227,29 @@ pub fn recv_response_with_fd(stream: &UnixStream) -> Result<(Response, Option<Ow
     let mut control = RecvAncillaryBuffer::new(&mut space);
 
     let msg = recvmsg(stream, &mut iov, &mut control, rustix::net::RecvFlags::empty())
-        .context("failed to receive response header and ancillary data")?;
+        .map_err(|e| Error::Io(e.into()))?;
 
     if msg.bytes != 4 {
-        bail!("failed to receive full response frame length");
+        return Err(Error::Proto("failed to receive full response frame length".to_string()));
     }
 
     let len = u32::from_le_bytes(len_bytes) as usize;
     if len > FRAME_MAX_BYTES {
-        bail!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes");
+        return Err(Error::Proto(format!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes")));
     }
 
     let mut body = vec![0u8; len];
     let mut body_reader = stream;
     body_reader
         .read_exact(&mut body)
-        .context("failed to read response frame body")?;
+        .map_err(|e| Error::Io(e))?;
 
     let response = decode_response(&body)?;
     let mut received_fd = None;
 
     for cmsg in control.drain() {
         if let RecvAncillaryMessage::ScmRights(fds) = cmsg {
-            received_fd = fds.map(|fd| fd.try_clone()).next().transpose()?;
+            received_fd = fds.map(|fd| fd.try_clone()).next().transpose().map_err(|e| Error::Io(e.into()))?;
         }
     }
 
@@ -242,16 +265,16 @@ pub async fn read_frame_async(
     reader
         .read_exact(&mut len)
         .await
-        .context("failed to read protobuf frame length")?;
+        .map_err(|e| Error::Io(e))?;
     let len = u32::from_le_bytes(len) as usize;
     if len > FRAME_MAX_BYTES {
-        bail!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes");
+        return Err(Error::Proto(format!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes")));
     }
     let mut frame = vec![0u8; len];
     reader
         .read_exact(&mut frame)
         .await
-        .context("failed to read protobuf frame body")?;
+        .map_err(|e| Error::Io(e))?;
     Ok(frame)
 }
 
@@ -262,11 +285,11 @@ pub async fn write_frame_async(
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     if frame.len() > FRAME_MAX_BYTES {
-        bail!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes");
+        return Err(Error::Proto(format!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes")));
     }
-    writer.write_all(&(frame.len() as u32).to_le_bytes()).await?;
-    writer.write_all(frame).await?;
-    writer.flush().await?;
+    writer.write_all(&(frame.len() as u32).to_le_bytes()).await.map_err(|e| Error::Io(e))?;
+    writer.write_all(frame).await.map_err(|e| Error::Io(e))?;
+    writer.flush().await.map_err(|e| Error::Io(e))?;
     Ok(())
 }
 
@@ -288,10 +311,10 @@ impl SharedAudioRing {
     pub fn create(capacity: usize) -> Result<Self> {
         let len = RING_HEADER_BYTES
             .checked_add(capacity)
-            .ok_or_else(|| anyhow!("ring size overflow"))?;
+            .ok_or_else(|| Error::Ring("ring size overflow".to_string()))?;
         let fd = memfd_create("rkwhisper-audio", MemfdFlags::CLOEXEC)
-            .context("failed to create audio memfd")?;
-        ftruncate(&fd, len as u64).context("failed to size audio memfd")?;
+            .map_err(|e| Error::Io(e.into()))?;
+        ftruncate(&fd, len as u64).map_err(|e| Error::Io(e.into()))?;
         let ring = Self::attach(fd, capacity)?;
         ring.init_header();
         Ok(ring)
@@ -300,7 +323,7 @@ impl SharedAudioRing {
     pub fn attach(fd: OwnedFd, capacity: usize) -> Result<Self> {
         let len = RING_HEADER_BYTES
             .checked_add(capacity)
-            .ok_or_else(|| anyhow!("ring size overflow"))?;
+            .ok_or_else(|| Error::Ring("ring size overflow".to_string()))?;
         let ptr = unsafe {
             mmap(
                 null_mut(),
@@ -311,7 +334,7 @@ impl SharedAudioRing {
                 0,
             )
         }
-        .context("failed to map audio memfd")? as *mut u8;
+        .map_err(|e| Error::Ring(format!("failed to map audio memfd: {e}")))? as *mut u8;
 
         Ok(Self {
             fd,
@@ -345,28 +368,27 @@ impl SharedAudioRing {
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut control = SendAncillaryBuffer::new(&mut space);
         if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
-            bail!("failed to prepare memfd ancillary data");
+            return Err(Error::Ring("failed to prepare memfd ancillary data".to_string()));
         }
         let sent = sendmsg(stream, &iov, &mut control, SendFlags::empty())
-            .context("failed to send audio memfd")?;
+            .map_err(|e| Error::Io(e.into()))?;
         if sent != 1 {
-            bail!("failed to send audio memfd marker byte");
+            return Err(Error::Ring("failed to send audio memfd marker byte".to_string()));
         }
         Ok(())
     }
 
     pub fn recv_fd(stream: &UnixStream) -> Result<OwnedFd> {
-
         let mut byte = [0u8; 1];
         let mut iov = [rustix::io::IoSliceMut::new(&mut byte)];
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut control = RecvAncillaryBuffer::new(&mut space);
 
         let msg = recvmsg(stream, &mut iov, &mut control, rustix::net::RecvFlags::empty())
-            .context("failed to receive audio memfd")?;
+            .map_err(|e| Error::Io(e.into()))?;
 
         if msg.bytes != 1 {
-            bail!("failed to receive audio memfd marker byte");
+            return Err(Error::Ring("failed to receive audio memfd marker byte".to_string()));
         }
 
         for cmsg in control.drain() {
@@ -374,19 +396,20 @@ impl SharedAudioRing {
                 return fds
                     .map(|fd| fd.try_clone())
                     .next()
-                    .transpose()?
-                    .ok_or_else(|| anyhow!("no file descriptor received"));
+                    .transpose()
+                    .map_err(|e| Error::Io(e.into()))?
+                    .ok_or_else(|| Error::Ring("no file descriptor received".to_string()));
             }
         }
 
-        bail!("no file descriptor received in ancillary data");
+        Err(Error::Ring("no file descriptor received in ancillary data".to_string()))
     }
 
     pub fn drain_available(&self, out: &mut Vec<u8>) -> Result<()> {
         let read = self.read_offset();
         let write = self.write_offset();
         if write.saturating_sub(read) > self.capacity as u64 {
-            bail!("shared-memory ring overrun");
+            return Err(Error::Ring("shared-memory ring overrun".to_string()));
         }
         if write <= read {
             return Ok(());
@@ -406,7 +429,7 @@ impl SharedAudioRing {
         let read = self.read_offset();
         let write = self.write_offset();
         if write.saturating_sub(read) > self.capacity as u64 {
-            bail!("shared-memory ring overrun");
+            return Err(Error::Ring("shared-memory ring overrun".to_string()));
         }
         let available = self.capacity - (write - read) as usize;
         let to_write = data.len().min(available);
@@ -489,7 +512,7 @@ pub struct SharedAudioRing;
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 impl SharedAudioRing {
     pub fn create(_capacity: usize) -> Result<Self> {
-        bail!("shared-memory daemon protocol requires Linux or FreeBSD memfd support")
+        Err(Error::Other("shared-memory daemon protocol requires Linux or FreeBSD memfd support".to_string()))
     }
 
     pub fn capacity(&self) -> usize {
@@ -497,7 +520,7 @@ impl SharedAudioRing {
     }
 
     pub fn send_fd(&self, _stream: &UnixStream) -> Result<()> {
-        bail!("shared-memory daemon protocol requires Linux or FreeBSD memfd support")
+        Err(Error::Other("shared-memory daemon protocol requires Linux or FreeBSD memfd support".to_string()))
     }
 
     pub fn drain_available(&self, _out: &mut Vec<u8>) -> Result<()> {
@@ -521,11 +544,12 @@ pub fn decode_client_hello(bytes: &[u8]) -> Result<ClientHello> {
             (8, 2) => hello.suppress_tokens = input.string()?,
             (9, 2) => hello.audio_format = decode_audio_format(input.bytes()?)?,
             (10, 2) => hello.vad = decode_vad_options(input.bytes()?)?,
+            (11, 2) => hello.client_id = input.string()?,
             (_, _) => input.skip(wire)?,
         }
     }
     if hello.model.is_empty() {
-        bail!("client hello missing model");
+        return Err(Error::Proto("client hello missing model".to_string()));
     }
     Ok(hello)
 }
@@ -606,6 +630,18 @@ fn encode_response(response: Response) -> Vec<u8> {
             field_varint(&mut msg, 2, retry_after_ms as u64);
             field_message(&mut out, 6, &msg);
         }
+        Response::SpeechStarted { begin } => {
+            let mut msg = Vec::new();
+            field_varint(&mut msg, 1, 1); // STARTED
+            field_fixed32(&mut msg, 2, begin);
+            field_message(&mut out, 7, &msg);
+        }
+        Response::SpeechEnded { end } => {
+            let mut msg = Vec::new();
+            field_varint(&mut msg, 1, 2); // ENDED
+            field_fixed32(&mut msg, 2, end);
+            field_message(&mut out, 7, &msg);
+        }
     }
     out
 }
@@ -638,6 +674,7 @@ pub fn encode_client_hello(hello: &ClientHello) -> Vec<u8> {
     field_string(&mut out, 8, &hello.suppress_tokens);
     field_message(&mut out, 9, &encode_audio_format(&hello.audio_format));
     field_message(&mut out, 10, &encode_vad_options(&hello.vad));
+    field_string(&mut out, 11, &hello.client_id);
     out
 }
 
@@ -665,7 +702,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<Response> {
     let mut input = ProtoInput::new(bytes);
     let (field, wire) = input.key()?;
     if wire != 2 {
-        bail!("invalid response wire type {wire}");
+        return Err(Error::Proto(format!("invalid response wire type {wire}")));
     }
     let body = input.bytes()?;
     match field {
@@ -677,7 +714,8 @@ pub fn decode_response(bytes: &[u8]) -> Result<Response> {
         }),
         5 => decode_cancelled(body),
         6 => decode_back_off(body),
-        _ => bail!("unknown response field {field}"),
+        7 => decode_speech_event(body),
+        _ => Err(Error::Proto(format!("unknown response field {field}"))),
     }
 }
 
@@ -787,6 +825,25 @@ fn decode_back_off(bytes: &[u8]) -> Result<Response> {
     })
 }
 
+fn decode_speech_event(bytes: &[u8]) -> Result<Response> {
+    let mut event_type = 0u64;
+    let mut timestamp = 0.0f32;
+    let mut input = ProtoInput::new(bytes);
+    while !input.is_empty() {
+        let (field, wire) = input.key()?;
+        match (field, wire) {
+            (1, 0) => event_type = input.varint()?,
+            (2, 5) => timestamp = input.fixed32()?,
+            (_, _) => input.skip(wire)?,
+        }
+    }
+    match event_type {
+        1 => Ok(Response::SpeechStarted { begin: timestamp }),
+        2 => Ok(Response::SpeechEnded { end: timestamp }),
+        _ => Err(Error::Proto(format!("unknown speech event type {event_type}"))),
+    }
+}
+
 fn field_varint(out: &mut Vec<u8>, field: u32, value: u64) {
     varint(out, ((field as u64) << 3) | 0);
     varint(out, value);
@@ -840,14 +897,14 @@ impl<'a> ProtoInput<'a> {
             let byte = *self
                 .bytes
                 .get(self.pos)
-                .ok_or_else(|| anyhow!("truncated protobuf varint"))?;
+                .ok_or_else(|| Error::Proto("truncated protobuf varint".to_string()))?;
             self.pos += 1;
             value |= ((byte & 0x7f) as u64) << shift;
             if byte & 0x80 == 0 {
                 return Ok(value);
             }
         }
-        bail!("protobuf varint too long");
+        Err(Error::Proto("protobuf varint too long".to_string()))
     }
 
     fn bytes(&mut self) -> Result<&'a [u8]> {
@@ -855,18 +912,18 @@ impl<'a> ProtoInput<'a> {
         let end = self
             .pos
             .checked_add(len)
-            .ok_or_else(|| anyhow!("protobuf length overflow"))?;
+            .ok_or_else(|| Error::Proto("protobuf length overflow".to_string()))?;
         let bytes = self
             .bytes
             .get(self.pos..end)
-            .ok_or_else(|| anyhow!("truncated protobuf length-delimited field"))?;
+            .ok_or_else(|| Error::Proto("truncated protobuf length-delimited field".to_string()))?;
         self.pos = end;
         Ok(bytes)
     }
 
     fn string(&mut self) -> Result<String> {
         Ok(std::str::from_utf8(self.bytes()?)
-            .context("protobuf string is not valid UTF-8")?
+            .map_err(|_| Error::Proto("protobuf string is not valid UTF-8".to_string()))?
             .to_string())
     }
 
@@ -875,7 +932,7 @@ impl<'a> ProtoInput<'a> {
         let bytes = self
             .bytes
             .get(self.pos..end)
-            .ok_or_else(|| anyhow!("truncated protobuf fixed32"))?;
+            .ok_or_else(|| Error::Proto("truncated protobuf fixed32".to_string()))?;
         self.pos = end;
         Ok(f32::from_le_bytes(bytes.try_into().unwrap()))
     }
@@ -890,10 +947,10 @@ impl<'a> ProtoInput<'a> {
                 self.bytes()?;
             }
             5 => self.pos += 4,
-            _ => bail!("unsupported protobuf wire type {wire}"),
+            _ => return Err(Error::Proto(format!("unsupported protobuf wire type {wire}"))),
         }
         if self.pos > self.bytes.len() {
-            bail!("truncated protobuf field");
+            return Err(Error::Proto("truncated protobuf field".to_string()));
         }
         Ok(())
     }
@@ -920,6 +977,7 @@ mod tests {
         field_varint(&mut msg, 6, 2);
         field_message(&mut msg, 9, &audio);
         field_message(&mut msg, 10, &vad);
+        field_string(&mut msg, 11, "test-client");
 
         let hello = decode_client_hello(&msg).unwrap();
         assert_eq!(hello.model, "whisper-small-30s");
@@ -927,6 +985,7 @@ mod tests {
         assert_eq!(hello.beam_size, 2);
         assert_eq!(hello.audio_format.sample_rate, 16_000);
         assert_eq!(hello.vad.min_speech_ms, Some(300));
+        assert_eq!(hello.client_id, "test-client");
     }
 
     #[test]
