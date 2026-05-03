@@ -225,7 +225,10 @@ fn handle_connection(
     }
 
     if !job_finished {
-        write_error(&mut writer.into_inner()?, "model scheduler thread exited unexpectedly")?;
+        write_error(
+            &mut writer.into_inner()?,
+            "model scheduler thread exited unexpectedly",
+        )?;
     }
 
     Ok(())

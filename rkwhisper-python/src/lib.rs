@@ -1,6 +1,6 @@
-use pyo3::prelude::*;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
 use rkwhisper_protocol::{ClientHello, SAMPLE_RATE};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -205,11 +205,15 @@ impl SyncSession {
     }
 
     fn finish(&mut self) -> PyResult<()> {
-        self.inner.finish().map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        self.inner
+            .finish()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     fn cancel(&mut self) -> PyResult<()> {
-        self.inner.cancel().map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        self.inner
+            .cancel()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {
@@ -258,7 +262,9 @@ impl SyncSession {
             Ok(rkwhisper_protocol::Response::Done { audio_s, rtf }) => {
                 Ok(Some(PyDone { audio_s, rtf }.into_py_any(py)?))
             }
-            Ok(rkwhisper_protocol::Response::Error { error }) => Err(PyRuntimeError::new_err(error)),
+            Ok(rkwhisper_protocol::Response::Error { error }) => {
+                Err(PyRuntimeError::new_err(error))
+            }
             Ok(rkwhisper_protocol::Response::ServerHello(_)) => {
                 Err(PyRuntimeError::new_err("unexpected server hello"))
             }
@@ -329,12 +335,12 @@ impl AsyncSession {
         let slice = pcm
             .as_slice(py)
             .ok_or_else(|| PyRuntimeError::new_err("PCM buffer is not C-contiguous"))?;
-        
+
         let mut data = Vec::with_capacity(slice.len());
         for cell in slice {
             data.push(cell.get());
         }
-        
+
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut session = inner.lock().await;
@@ -376,32 +382,30 @@ impl AsyncSession {
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            Python::with_gil(|py| {
-                match response {
-                    rkwhisper_protocol::Response::Segment { text, begin, end } => {
-                        Ok(PySegment { text, begin, end }.into_py_any(py)?)
-                    }
-                    rkwhisper_protocol::Response::SpeechStarted { begin } => {
-                        Ok(PySpeechStarted { begin }.into_py_any(py)?)
-                    }
-                    rkwhisper_protocol::Response::SpeechEnded { end } => {
-                        Ok(PySpeechEnded { end }.into_py_any(py)?)
-                    }
-                    rkwhisper_protocol::Response::Done { audio_s, rtf } => {
-                        Ok(PyDone { audio_s, rtf }.into_py_any(py)?)
-                    }
-                    rkwhisper_protocol::Response::Error { error } => {
-                        Err(PyRuntimeError::new_err(error))
-                    }
-                    rkwhisper_protocol::Response::ServerHello(_) => {
-                        Err(PyRuntimeError::new_err("unexpected server hello"))
-                    }
-                    rkwhisper_protocol::Response::Cancelled { .. } => {
-                        Err(PyRuntimeError::new_err("session cancelled"))
-                    }
-                    rkwhisper_protocol::Response::BackOff { reason, .. } => {
-                        Err(PyRuntimeError::new_err(format!("server backoff: {reason}")))
-                    }
+            Python::with_gil(|py| match response {
+                rkwhisper_protocol::Response::Segment { text, begin, end } => {
+                    Ok(PySegment { text, begin, end }.into_py_any(py)?)
+                }
+                rkwhisper_protocol::Response::SpeechStarted { begin } => {
+                    Ok(PySpeechStarted { begin }.into_py_any(py)?)
+                }
+                rkwhisper_protocol::Response::SpeechEnded { end } => {
+                    Ok(PySpeechEnded { end }.into_py_any(py)?)
+                }
+                rkwhisper_protocol::Response::Done { audio_s, rtf } => {
+                    Ok(PyDone { audio_s, rtf }.into_py_any(py)?)
+                }
+                rkwhisper_protocol::Response::Error { error } => {
+                    Err(PyRuntimeError::new_err(error))
+                }
+                rkwhisper_protocol::Response::ServerHello(_) => {
+                    Err(PyRuntimeError::new_err("unexpected server hello"))
+                }
+                rkwhisper_protocol::Response::Cancelled { .. } => {
+                    Err(PyRuntimeError::new_err("session cancelled"))
+                }
+                rkwhisper_protocol::Response::BackOff { reason, .. } => {
+                    Err(PyRuntimeError::new_err(format!("server backoff: {reason}")))
                 }
             })
         })
@@ -420,32 +424,30 @@ impl AsyncSession {
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            Python::with_gil(|py| {
-                match response {
-                    rkwhisper_protocol::Response::Done { .. } => {
-                        Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
-                    }
-                    rkwhisper_protocol::Response::Segment { text, begin, end } => {
-                        Ok(PySegment { text, begin, end }.into_py_any(py)?)
-                    }
-                    rkwhisper_protocol::Response::SpeechStarted { begin } => {
-                        Ok(PySpeechStarted { begin }.into_py_any(py)?)
-                    }
-                    rkwhisper_protocol::Response::SpeechEnded { end } => {
-                        Ok(PySpeechEnded { end }.into_py_any(py)?)
-                    }
-                    rkwhisper_protocol::Response::Error { error } => {
-                        Err(PyRuntimeError::new_err(error))
-                    }
-                    rkwhisper_protocol::Response::ServerHello(_) => {
-                        Err(PyRuntimeError::new_err("unexpected server hello"))
-                    }
-                    rkwhisper_protocol::Response::Cancelled { .. } => {
-                        Err(PyRuntimeError::new_err("session cancelled"))
-                    }
-                    rkwhisper_protocol::Response::BackOff { reason, .. } => {
-                        Err(PyRuntimeError::new_err(format!("server backoff: {reason}")))
-                    }
+            Python::with_gil(|py| match response {
+                rkwhisper_protocol::Response::Done { .. } => {
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+                rkwhisper_protocol::Response::Segment { text, begin, end } => {
+                    Ok(PySegment { text, begin, end }.into_py_any(py)?)
+                }
+                rkwhisper_protocol::Response::SpeechStarted { begin } => {
+                    Ok(PySpeechStarted { begin }.into_py_any(py)?)
+                }
+                rkwhisper_protocol::Response::SpeechEnded { end } => {
+                    Ok(PySpeechEnded { end }.into_py_any(py)?)
+                }
+                rkwhisper_protocol::Response::Error { error } => {
+                    Err(PyRuntimeError::new_err(error))
+                }
+                rkwhisper_protocol::Response::ServerHello(_) => {
+                    Err(PyRuntimeError::new_err("unexpected server hello"))
+                }
+                rkwhisper_protocol::Response::Cancelled { .. } => {
+                    Err(PyRuntimeError::new_err("session cancelled"))
+                }
+                rkwhisper_protocol::Response::BackOff { reason, .. } => {
+                    Err(PyRuntimeError::new_err(format!("server backoff: {reason}")))
                 }
             })
         })

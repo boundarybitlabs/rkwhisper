@@ -1,8 +1,8 @@
+pub use rkwhisper_protocol::{AudioFormat, ClientHello, Response, VadOptions};
 use rkwhisper_protocol::{
-    decode_response, encode_client_hello, SharedAudioRing,
-    SIGNAL_CANCEL, SIGNAL_DATA_READY, SIGNAL_END_OF_STREAM,
+    SIGNAL_CANCEL, SIGNAL_DATA_READY, SIGNAL_END_OF_STREAM, SharedAudioRing, decode_response,
+    encode_client_hello,
 };
-pub use rkwhisper_protocol::{ClientHello, Response, AudioFormat, VadOptions};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -61,7 +61,8 @@ pub mod sync {
             let max_retries = 5;
 
             loop {
-                let mut stream = UnixStream::connect(socket_path.as_ref()).map_err(Error::Connection)?;
+                let mut stream =
+                    UnixStream::connect(socket_path.as_ref()).map_err(Error::Connection)?;
 
                 // 1. Send ClientHello
                 let encoded_hello = encode_client_hello(&hello);
@@ -92,7 +93,7 @@ pub mod sync {
                     }
                     Response::Error { error } => return Err(Error::Handshake(error)),
                     other => {
-                        return Err(Error::Handshake(format!("unexpected response: {other:?}")))
+                        return Err(Error::Handshake(format!("unexpected response: {other:?}")));
                     }
                 }
             }
@@ -104,7 +105,9 @@ pub mod sync {
                 let n = self.ring.push_available(&pcm[pos..])?;
                 if n > 0 {
                     pos += n;
-                    self.stream.write_all(&[SIGNAL_DATA_READY]).map_err(Error::Connection)?;
+                    self.stream
+                        .write_all(&[SIGNAL_DATA_READY])
+                        .map_err(Error::Connection)?;
                 } else {
                     // Ring is full, wait a bit or backoff
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -114,12 +117,16 @@ pub mod sync {
         }
 
         pub fn finish(&mut self) -> Result<()> {
-            self.stream.write_all(&[SIGNAL_END_OF_STREAM]).map_err(Error::Connection)?;
+            self.stream
+                .write_all(&[SIGNAL_END_OF_STREAM])
+                .map_err(Error::Connection)?;
             Ok(())
         }
 
         pub fn cancel(&mut self) -> Result<()> {
-            self.stream.write_all(&[SIGNAL_CANCEL]).map_err(Error::Connection)?;
+            self.stream
+                .write_all(&[SIGNAL_CANCEL])
+                .map_err(Error::Connection)?;
             Ok(())
         }
 
@@ -197,9 +204,13 @@ pub mod asynchronous {
                 // 2. Receive Response and potential FD (switch to std for recvmsg)
                 let (response, fd, stream_back) = tokio::task::spawn_blocking(move || {
                     let std_stream = stream.into_std().map_err(Error::Connection)?;
-                    std_stream.set_nonblocking(false).map_err(Error::Connection)?;
+                    std_stream
+                        .set_nonblocking(false)
+                        .map_err(Error::Connection)?;
                     let (response, fd) = rkwhisper_protocol::recv_response_with_fd(&std_stream)?;
-                    std_stream.set_nonblocking(true).map_err(Error::Connection)?;
+                    std_stream
+                        .set_nonblocking(true)
+                        .map_err(Error::Connection)?;
                     let stream = UnixStream::from_std(std_stream).map_err(Error::Connection)?;
                     Ok::<(Response, Option<std::os::fd::OwnedFd>, UnixStream), Error>((
                         response, fd, stream,
@@ -234,7 +245,7 @@ pub mod asynchronous {
                     }
                     Response::Error { error } => return Err(Error::Handshake(error)),
                     other => {
-                        return Err(Error::Handshake(format!("unexpected response: {other:?}")))
+                        return Err(Error::Handshake(format!("unexpected response: {other:?}")));
                     }
                 }
             }
@@ -246,7 +257,10 @@ pub mod asynchronous {
                 let n = self.ring.push_available(&pcm[pos..])?;
                 if n > 0 {
                     pos += n;
-                    self.stream.write_all(&[SIGNAL_DATA_READY]).await.map_err(Error::Connection)?;
+                    self.stream
+                        .write_all(&[SIGNAL_DATA_READY])
+                        .await
+                        .map_err(Error::Connection)?;
                 } else {
                     // Ring is full, wait a bit
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -256,12 +270,18 @@ pub mod asynchronous {
         }
 
         pub async fn finish(&mut self) -> Result<()> {
-            self.stream.write_all(&[SIGNAL_END_OF_STREAM]).await.map_err(Error::Connection)?;
+            self.stream
+                .write_all(&[SIGNAL_END_OF_STREAM])
+                .await
+                .map_err(Error::Connection)?;
             Ok(())
         }
 
         pub async fn cancel(&mut self) -> Result<()> {
-            self.stream.write_all(&[SIGNAL_CANCEL]).await.map_err(Error::Connection)?;
+            self.stream
+                .write_all(&[SIGNAL_CANCEL])
+                .await
+                .map_err(Error::Connection)?;
             Ok(())
         }
 

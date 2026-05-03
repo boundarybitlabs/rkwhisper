@@ -27,8 +27,8 @@ use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 use rustix::net::{
-    RecvAncillaryBuffer, RecvAncillaryMessage, SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
-    recvmsg, sendmsg,
+    RecvAncillaryBuffer, RecvAncillaryMessage, SendAncillaryBuffer, SendAncillaryMessage,
+    SendFlags, recvmsg, sendmsg,
 };
 
 pub const FRAME_MAX_BYTES: usize = 1024 * 1024;
@@ -151,7 +151,9 @@ pub fn validate_client_hello(hello: &ClientHello) -> Result<()> {
         || hello.audio_format.channels != 1
         || hello.audio_format.sample_format != SAMPLE_FORMAT_S16LE
     {
-        return Err(Error::Invalid("unsupported audio format; expected 16 kHz mono s16le".to_string()));
+        return Err(Error::Invalid(
+            "unsupported audio format; expected 16 kHz mono s16le".to_string(),
+        ));
     }
     Ok(())
 }
@@ -167,25 +169,27 @@ pub fn write_response(writer: &mut impl Write, response: Response) -> Result<()>
 
 pub fn read_frame(reader: &mut impl Read) -> Result<Vec<u8>> {
     let mut len = [0u8; 4];
-    reader
-        .read_exact(&mut len)
-        .map_err(|e| Error::Io(e))?;
+    reader.read_exact(&mut len).map_err(|e| Error::Io(e))?;
     let len = u32::from_le_bytes(len) as usize;
     if len > FRAME_MAX_BYTES {
-        return Err(Error::Proto(format!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes")));
+        return Err(Error::Proto(format!(
+            "protobuf frame exceeds {FRAME_MAX_BYTES} bytes"
+        )));
     }
     let mut frame = vec![0u8; len];
-    reader
-        .read_exact(&mut frame)
-        .map_err(|e| Error::Io(e))?;
+    reader.read_exact(&mut frame).map_err(|e| Error::Io(e))?;
     Ok(frame)
 }
 
 pub fn write_frame(writer: &mut impl Write, frame: &[u8]) -> Result<()> {
     if frame.len() > FRAME_MAX_BYTES {
-        return Err(Error::Proto(format!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes")));
+        return Err(Error::Proto(format!(
+            "protobuf frame exceeds {FRAME_MAX_BYTES} bytes"
+        )));
     }
-    writer.write_all(&(frame.len() as u32).to_le_bytes()).map_err(|e| Error::Io(e))?;
+    writer
+        .write_all(&(frame.len() as u32).to_le_bytes())
+        .map_err(|e| Error::Io(e))?;
     writer.write_all(frame).map_err(|e| Error::Io(e))?;
     writer.flush().map_err(|e| Error::Io(e))?;
     Ok(())
@@ -198,7 +202,9 @@ pub fn send_response_with_fd(
 ) -> Result<()> {
     let frame = encode_response(response);
     if frame.len() > FRAME_MAX_BYTES {
-        return Err(Error::Proto(format!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes")));
+        return Err(Error::Proto(format!(
+            "protobuf frame exceeds {FRAME_MAX_BYTES} bytes"
+        )));
     }
 
     let len_bytes = (frame.len() as u32).to_le_bytes();
@@ -209,12 +215,10 @@ pub fn send_response_with_fd(
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut control = SendAncillaryBuffer::new(&mut space);
         control.push(SendAncillaryMessage::ScmRights(&fds));
-        sendmsg(stream, &iov, &mut control, SendFlags::empty())
-            .map_err(|e| Error::Io(e.into()))?;
+        sendmsg(stream, &iov, &mut control, SendFlags::empty()).map_err(|e| Error::Io(e.into()))?;
     } else {
         let mut control = SendAncillaryBuffer::new(&mut []);
-        sendmsg(stream, &iov, &mut control, SendFlags::empty())
-            .map_err(|e| Error::Io(e.into()))?;
+        sendmsg(stream, &iov, &mut control, SendFlags::empty()).map_err(|e| Error::Io(e.into()))?;
     }
 
     Ok(())
@@ -226,16 +230,25 @@ pub fn recv_response_with_fd(stream: &UnixStream) -> Result<(Response, Option<Ow
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
 
-    let msg = recvmsg(stream, &mut iov, &mut control, rustix::net::RecvFlags::empty())
-        .map_err(|e| Error::Io(e.into()))?;
+    let msg = recvmsg(
+        stream,
+        &mut iov,
+        &mut control,
+        rustix::net::RecvFlags::empty(),
+    )
+    .map_err(|e| Error::Io(e.into()))?;
 
     if msg.bytes != 4 {
-        return Err(Error::Proto("failed to receive full response frame length".to_string()));
+        return Err(Error::Proto(
+            "failed to receive full response frame length".to_string(),
+        ));
     }
 
     let len = u32::from_le_bytes(len_bytes) as usize;
     if len > FRAME_MAX_BYTES {
-        return Err(Error::Proto(format!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes")));
+        return Err(Error::Proto(format!(
+            "protobuf frame exceeds {FRAME_MAX_BYTES} bytes"
+        )));
     }
 
     let mut body = vec![0u8; len];
@@ -249,7 +262,11 @@ pub fn recv_response_with_fd(stream: &UnixStream) -> Result<(Response, Option<Ow
 
     for cmsg in control.drain() {
         if let RecvAncillaryMessage::ScmRights(fds) = cmsg {
-            received_fd = fds.map(|fd| fd.try_clone()).next().transpose().map_err(|e| Error::Io(e.into()))?;
+            received_fd = fds
+                .map(|fd| fd.try_clone())
+                .next()
+                .transpose()
+                .map_err(|e| Error::Io(e.into()))?;
         }
     }
 
@@ -257,9 +274,7 @@ pub fn recv_response_with_fd(stream: &UnixStream) -> Result<(Response, Option<Ow
 }
 
 #[cfg(feature = "async")]
-pub async fn read_frame_async(
-    reader: &mut (impl tokio::io::AsyncRead + Unpin),
-) -> Result<Vec<u8>> {
+pub async fn read_frame_async(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut len = [0u8; 4];
     reader
@@ -268,7 +283,9 @@ pub async fn read_frame_async(
         .map_err(|e| Error::Io(e))?;
     let len = u32::from_le_bytes(len) as usize;
     if len > FRAME_MAX_BYTES {
-        return Err(Error::Proto(format!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes")));
+        return Err(Error::Proto(format!(
+            "protobuf frame exceeds {FRAME_MAX_BYTES} bytes"
+        )));
     }
     let mut frame = vec![0u8; len];
     reader
@@ -285,9 +302,14 @@ pub async fn write_frame_async(
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     if frame.len() > FRAME_MAX_BYTES {
-        return Err(Error::Proto(format!("protobuf frame exceeds {FRAME_MAX_BYTES} bytes")));
+        return Err(Error::Proto(format!(
+            "protobuf frame exceeds {FRAME_MAX_BYTES} bytes"
+        )));
     }
-    writer.write_all(&(frame.len() as u32).to_le_bytes()).await.map_err(|e| Error::Io(e))?;
+    writer
+        .write_all(&(frame.len() as u32).to_le_bytes())
+        .await
+        .map_err(|e| Error::Io(e))?;
     writer.write_all(frame).await.map_err(|e| Error::Io(e))?;
     writer.flush().await.map_err(|e| Error::Io(e))?;
     Ok(())
@@ -334,7 +356,8 @@ impl SharedAudioRing {
                 0,
             )
         }
-        .map_err(|e| Error::Ring(format!("failed to map audio memfd: {e}")))? as *mut u8;
+        .map_err(|e| Error::Ring(format!("failed to map audio memfd: {e}")))?
+            as *mut u8;
 
         Ok(Self {
             fd,
@@ -368,12 +391,16 @@ impl SharedAudioRing {
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut control = SendAncillaryBuffer::new(&mut space);
         if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
-            return Err(Error::Ring("failed to prepare memfd ancillary data".to_string()));
+            return Err(Error::Ring(
+                "failed to prepare memfd ancillary data".to_string(),
+            ));
         }
         let sent = sendmsg(stream, &iov, &mut control, SendFlags::empty())
             .map_err(|e| Error::Io(e.into()))?;
         if sent != 1 {
-            return Err(Error::Ring("failed to send audio memfd marker byte".to_string()));
+            return Err(Error::Ring(
+                "failed to send audio memfd marker byte".to_string(),
+            ));
         }
         Ok(())
     }
@@ -384,11 +411,18 @@ impl SharedAudioRing {
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut control = RecvAncillaryBuffer::new(&mut space);
 
-        let msg = recvmsg(stream, &mut iov, &mut control, rustix::net::RecvFlags::empty())
-            .map_err(|e| Error::Io(e.into()))?;
+        let msg = recvmsg(
+            stream,
+            &mut iov,
+            &mut control,
+            rustix::net::RecvFlags::empty(),
+        )
+        .map_err(|e| Error::Io(e.into()))?;
 
         if msg.bytes != 1 {
-            return Err(Error::Ring("failed to receive audio memfd marker byte".to_string()));
+            return Err(Error::Ring(
+                "failed to receive audio memfd marker byte".to_string(),
+            ));
         }
 
         for cmsg in control.drain() {
@@ -402,7 +436,9 @@ impl SharedAudioRing {
             }
         }
 
-        Err(Error::Ring("no file descriptor received in ancillary data".to_string()))
+        Err(Error::Ring(
+            "no file descriptor received in ancillary data".to_string(),
+        ))
     }
 
     pub fn drain_available(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -512,7 +548,9 @@ pub struct SharedAudioRing;
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 impl SharedAudioRing {
     pub fn create(_capacity: usize) -> Result<Self> {
-        Err(Error::Other("shared-memory daemon protocol requires Linux or FreeBSD memfd support".to_string()))
+        Err(Error::Other(
+            "shared-memory daemon protocol requires Linux or FreeBSD memfd support".to_string(),
+        ))
     }
 
     pub fn capacity(&self) -> usize {
@@ -520,7 +558,9 @@ impl SharedAudioRing {
     }
 
     pub fn send_fd(&self, _stream: &UnixStream) -> Result<()> {
-        Err(Error::Other("shared-memory daemon protocol requires Linux or FreeBSD memfd support".to_string()))
+        Err(Error::Other(
+            "shared-memory daemon protocol requires Linux or FreeBSD memfd support".to_string(),
+        ))
     }
 
     pub fn drain_available(&self, _out: &mut Vec<u8>) -> Result<()> {
@@ -840,7 +880,9 @@ fn decode_speech_event(bytes: &[u8]) -> Result<Response> {
     match event_type {
         1 => Ok(Response::SpeechStarted { begin: timestamp }),
         2 => Ok(Response::SpeechEnded { end: timestamp }),
-        _ => Err(Error::Proto(format!("unknown speech event type {event_type}"))),
+        _ => Err(Error::Proto(format!(
+            "unknown speech event type {event_type}"
+        ))),
     }
 }
 
@@ -947,7 +989,11 @@ impl<'a> ProtoInput<'a> {
                 self.bytes()?;
             }
             5 => self.pos += 4,
-            _ => return Err(Error::Proto(format!("unsupported protobuf wire type {wire}"))),
+            _ => {
+                return Err(Error::Proto(format!(
+                    "unsupported protobuf wire type {wire}"
+                )));
+            }
         }
         if self.pos > self.bytes.len() {
             return Err(Error::Proto("truncated protobuf field".to_string()));
