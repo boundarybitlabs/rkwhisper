@@ -1,11 +1,51 @@
-use anyhow::{Result, bail, anyhow};
 use rkwhisper_protocol::{
-    decode_response, encode_client_hello, ClientHello, Response, SharedAudioRing,
+    decode_response, encode_client_hello, SharedAudioRing,
     SIGNAL_CANCEL, SIGNAL_DATA_READY, SIGNAL_END_OF_STREAM,
 };
+pub use rkwhisper_protocol::{ClientHello, Response, AudioFormat, VadOptions};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("connection failed: {0}")]
+    Connection(#[from] std::io::Error),
+    #[error("protocol error: {0}")]
+    Protocol(#[from] rkwhisper_protocol::Error),
+    #[error("handshake failed: {0}")]
+    Handshake(String),
+    #[error("server error: {0}")]
+    Daemon(String),
+    #[error("session cancelled")]
+    Cancelled,
+    #[error("internal error: {0}")]
+    Other(String),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Transcription {
+    pub text: String,
+    pub segments: Vec<TranscriptSegment>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TranscriptSegment {
+    pub start_sec: f32,
+    pub end_sec: f32,
+    pub text: String,
+}
+
+pub fn samples_to_pcm(samples: &[f32]) -> Vec<u8> {
+    let mut pcm = Vec::with_capacity(samples.len() * 2);
+    for &s in samples {
+        let s = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        pcm.extend_from_slice(&s.to_le_bytes());
+    }
+    pcm
+}
 
 pub mod sync {
     use super::*;
@@ -17,7 +57,7 @@ pub mod sync {
 
     impl Session {
         pub fn connect(socket_path: impl AsRef<Path>, hello: ClientHello) -> Result<Self> {
-            let mut stream = UnixStream::connect(socket_path)?;
+            let mut stream = UnixStream::connect(socket_path).map_err(Error::Connection)?;
 
             // 1. Send ClientHello
             let encoded_hello = encode_client_hello(&hello);
@@ -27,11 +67,11 @@ pub mod sync {
             let (response, fd) = rkwhisper_protocol::recv_response_with_fd(&stream)?;
             let server_hello = match response {
                 Response::ServerHello(sh) => sh,
-                Response::Error { error } => bail!("server error during handshake: {error}"),
-                other => bail!("unexpected response during handshake: {other:?}"),
+                Response::Error { error } => return Err(Error::Handshake(error)),
+                other => return Err(Error::Handshake(format!("unexpected response: {other:?}"))),
             };
 
-            let fd = fd.ok_or_else(|| anyhow!("no file descriptor received during handshake"))?;
+            let fd = fd.ok_or_else(|| Error::Handshake("no file descriptor received".to_string()))?;
 
             // 3. Attach to ring
             let ring = SharedAudioRing::attach(fd, server_hello.ring_capacity_bytes as usize)?;
@@ -45,7 +85,7 @@ pub mod sync {
                 let n = self.ring.push_available(&pcm[pos..])?;
                 if n > 0 {
                     pos += n;
-                    self.stream.write_all(&[SIGNAL_DATA_READY])?;
+                    self.stream.write_all(&[SIGNAL_DATA_READY]).map_err(Error::Connection)?;
                 } else {
                     // Ring is full, wait a bit or backoff
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -55,18 +95,57 @@ pub mod sync {
         }
 
         pub fn finish(&mut self) -> Result<()> {
-            self.stream.write_all(&[SIGNAL_END_OF_STREAM])?;
+            self.stream.write_all(&[SIGNAL_END_OF_STREAM]).map_err(Error::Connection)?;
             Ok(())
         }
 
         pub fn cancel(&mut self) -> Result<()> {
-            self.stream.write_all(&[SIGNAL_CANCEL])?;
+            self.stream.write_all(&[SIGNAL_CANCEL]).map_err(Error::Connection)?;
             Ok(())
         }
 
         pub fn recv_response(&mut self) -> Result<Response> {
             let frame = rkwhisper_protocol::read_frame(&mut self.stream)?;
-            decode_response(&frame)
+            let response = decode_response(&frame)?;
+            match response {
+                Response::Error { error } => Err(Error::Daemon(error)),
+                Response::Cancelled { .. } => Err(Error::Cancelled),
+                other => Ok(other),
+            }
+        }
+
+        pub fn transcribe_all(&mut self, samples: &[f32]) -> Result<Transcription> {
+            let pcm = samples_to_pcm(samples);
+            self.send_audio(&pcm)?;
+            self.finish()?;
+
+            let mut text = String::new();
+            let mut segments = Vec::new();
+
+            loop {
+                match self.recv_response()? {
+                    Response::Segment {
+                        text: t,
+                        begin,
+                        end,
+                    } => {
+                        text.push_str(&t);
+                        text.push(' ');
+                        segments.push(TranscriptSegment {
+                            start_sec: begin,
+                            end_sec: end,
+                            text: t,
+                        });
+                    }
+                    Response::Done { .. } => break,
+                    _ => {}
+                }
+            }
+
+            Ok(Transcription {
+                text: text.trim().to_string(),
+                segments,
+            })
         }
     }
 }
@@ -84,7 +163,7 @@ pub mod asynchronous {
 
     impl Session {
         pub async fn connect(socket_path: impl AsRef<Path>, hello: ClientHello) -> Result<Self> {
-            let mut stream = UnixStream::connect(socket_path).await?;
+            let mut stream = UnixStream::connect(socket_path).await.map_err(Error::Connection)?;
 
             // 1. Send ClientHello
             let encoded_hello = encode_client_hello(&hello);
@@ -92,24 +171,25 @@ pub mod asynchronous {
 
             // 2. Receive Response and potential FD (switch to std for recvmsg)
             let (response, fd, stream) = tokio::task::spawn_blocking(move || {
-                let std_stream = stream.into_std()?;
-                std_stream.set_nonblocking(false)?;
+                let std_stream = stream.into_std().map_err(Error::Connection)?;
+                std_stream.set_nonblocking(false).map_err(Error::Connection)?;
                 let (response, fd) = rkwhisper_protocol::recv_response_with_fd(&std_stream)?;
-                std_stream.set_nonblocking(true)?;
-                let stream = UnixStream::from_std(std_stream)?;
-                Ok::<(Response, Option<std::os::fd::OwnedFd>, UnixStream), anyhow::Error>((
+                std_stream.set_nonblocking(true).map_err(Error::Connection)?;
+                let stream = UnixStream::from_std(std_stream).map_err(Error::Connection)?;
+                Ok::<(Response, Option<std::os::fd::OwnedFd>, UnixStream), Error>((
                     response, fd, stream,
                 ))
             })
-            .await??;
+            .await
+            .map_err(|e| Error::Other(e.to_string()))??;
 
             let server_hello = match response {
                 Response::ServerHello(sh) => sh,
-                Response::Error { error } => bail!("server error during handshake: {error}"),
-                other => bail!("unexpected response during handshake: {other:?}"),
+                Response::Error { error } => return Err(Error::Handshake(error)),
+                other => return Err(Error::Handshake(format!("unexpected response: {other:?}"))),
             };
 
-            let fd = fd.ok_or_else(|| anyhow!("no file descriptor received during handshake"))?;
+            let fd = fd.ok_or_else(|| Error::Handshake("no file descriptor received".to_string()))?;
 
             // 3. Attach to ring
             let ring = SharedAudioRing::attach(fd, server_hello.ring_capacity_bytes as usize)?;
@@ -123,7 +203,7 @@ pub mod asynchronous {
                 let n = self.ring.push_available(&pcm[pos..])?;
                 if n > 0 {
                     pos += n;
-                    self.stream.write_all(&[SIGNAL_DATA_READY]).await?;
+                    self.stream.write_all(&[SIGNAL_DATA_READY]).await.map_err(Error::Connection)?;
                 } else {
                     // Ring is full, wait a bit
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -133,18 +213,57 @@ pub mod asynchronous {
         }
 
         pub async fn finish(&mut self) -> Result<()> {
-            self.stream.write_all(&[SIGNAL_END_OF_STREAM]).await?;
+            self.stream.write_all(&[SIGNAL_END_OF_STREAM]).await.map_err(Error::Connection)?;
             Ok(())
         }
 
         pub async fn cancel(&mut self) -> Result<()> {
-            self.stream.write_all(&[SIGNAL_CANCEL]).await?;
+            self.stream.write_all(&[SIGNAL_CANCEL]).await.map_err(Error::Connection)?;
             Ok(())
         }
 
         pub async fn recv_response(&mut self) -> Result<Response> {
             let frame = rkwhisper_protocol::read_frame_async(&mut self.stream).await?;
-            decode_response(&frame)
+            let response = decode_response(&frame)?;
+            match response {
+                Response::Error { error } => Err(Error::Daemon(error)),
+                Response::Cancelled { .. } => Err(Error::Cancelled),
+                other => Ok(other),
+            }
+        }
+
+        pub async fn transcribe_all(&mut self, samples: &[f32]) -> Result<Transcription> {
+            let pcm = samples_to_pcm(samples);
+            self.send_audio(&pcm).await?;
+            self.finish().await?;
+
+            let mut text = String::new();
+            let mut segments = Vec::new();
+
+            loop {
+                match self.recv_response().await? {
+                    Response::Segment {
+                        text: t,
+                        begin,
+                        end,
+                    } => {
+                        text.push_str(&t);
+                        text.push(' ');
+                        segments.push(TranscriptSegment {
+                            start_sec: begin,
+                            end_sec: end,
+                            text: t,
+                        });
+                    }
+                    Response::Done { .. } => break,
+                    _ => {}
+                }
+            }
+
+            Ok(Transcription {
+                text: text.trim().to_string(),
+                segments,
+            })
         }
     }
 }
