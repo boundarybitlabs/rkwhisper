@@ -1,6 +1,6 @@
 import pytest
 import os
-from rkwhisper_client import SyncSession, ClientHello
+from rkwhisper_client import SyncSession, AsyncSession, ClientHello
 
 SOCKET_PATH = os.getenv("RKWHISPER_SOCKET", "/run/rkwhisper/asr.sock")
 TEST_MODEL = os.getenv("RKWHISPER_TEST_MODEL", "whisper-small-30s")
@@ -10,6 +10,7 @@ TEST_MODEL = os.getenv("RKWHISPER_TEST_MODEL", "whisper-small-30s")
 def client_hello():
     """Default ClientHello for testing."""
     return ClientHello(model=TEST_MODEL, client_id="pytest-integration")
+
 
 @pytest.fixture
 def session_factory():
@@ -23,7 +24,6 @@ def session_factory():
         sessions.append(s)
         return s
 
-
     yield _create
 
     for s in sessions:
@@ -34,7 +34,35 @@ def session_factory():
 
 
 @pytest.fixture
+async def async_session_factory():
+    """Factory to create an async session with custom hello."""
+    sessions = []
+
+    async def _create(hello=None):
+        if hello is None:
+            hello = ClientHello(model=TEST_MODEL, client_id="pytest-async-integration")
+        s = await AsyncSession.connect(SOCKET_PATH, hello)
+        sessions.append(s)
+        return s
+
+    yield _create
+
+    for s in sessions:
+        try:
+            await s.cancel()
+        except Exception:
+            pass
+
+
+@pytest.fixture
 def session(client_hello):
-    """A standard session fixture."""
-    s = SyncSession.connect(SOCKET_PATH, client_hello)
-    yield s
+    """A standard sync session fixture."""
+    with SyncSession.connect(SOCKET_PATH, client_hello) as s:
+        yield s
+
+
+@pytest.fixture
+async def async_session(client_hello):
+    """A standard async session fixture."""
+    async with await AsyncSession.connect(SOCKET_PATH, client_hello) as s:
+        yield s
