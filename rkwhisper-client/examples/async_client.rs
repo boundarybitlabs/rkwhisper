@@ -19,24 +19,29 @@ async fn main() -> anyhow::Result<()> {
     let mut session = Session::connect(socket_path, hello).await?;
     println!("Connected! Handshake successful.");
 
-    // Just receive one response to verify it works
-    println!("Waiting for any response (send some audio to the socket if needed)...");
+    let (mut sender, mut receiver) = session.split();
 
-    // In a real example we would send audio, but here we just prove the plumbing.
-    // If we send nothing, it might just block or the daemon might time out.
+    // 1. Start audio sender task
+    let sender_handle = tokio::spawn(async move {
+        println!("Sender: Sending 1 second of silence...");
+        let silence = vec![0.0f32; 16000]; // 1 second
+        let pcm = rkwhisper_client::samples_to_pcm(&silence);
+        sender.send_audio(&pcm).await?;
+        sender.finish().await?;
+        println!("Sender: Finished.");
+        Ok::<(), anyhow::Error>(())
+    });
 
-    // Let's send a tiny bit of silence to get a response
-    let silence = vec![0.0f32; 16000]; // 1 second
-    let pcm = rkwhisper_client::samples_to_pcm(&silence);
-    session.send_audio(&pcm).await?;
-    session.finish().await?;
-
-    while let Ok(response) = session.recv_response().await {
+    // 2. Process responses in the main task
+    println!("Receiver: Waiting for responses...");
+    while let Ok(response) = receiver.recv_response().await {
         println!("Received: {:?}", response);
         if matches!(response, rkwhisper_protocol::Response::Done { .. }) {
             break;
         }
     }
+
+    sender_handle.await??;
 
     Ok(())
 }

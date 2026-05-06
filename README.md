@@ -192,6 +192,45 @@ UMask=0007
 ExecStart=/usr/bin/rkwhisperd --socket /run/rkwhisper/asr.sock
 ```
 
+## Python Client
+
+A high-performance Python client is provided in the `rkwhisper-python` package. It
+supports both synchronous and asynchronous usage.
+
+### Installation
+
+```sh
+cd rkwhisper-python
+maturin develop
+```
+
+### Concurrent Streaming
+
+For real-time transcription, use the `split()` API to decouple audio transmission
+from response receiving. This prevents deadlocks and enables incremental output.
+
+```python
+from rkwhisper_client import SyncSession, ClientHello
+
+hello = ClientHello(model="whisper-small-30s", mode="stream")
+with SyncSession.connect("/run/rkwhisper/asr.sock", hello) as session:
+    sender, receiver = session.split()
+
+    # Start a thread to consume incremental segments
+    def consume():
+        for resp in receiver:
+            if hasattr(resp, 'text'):
+                print(f"Segment: {resp.text}")
+
+    threading.Thread(target=consume, daemon=True).start()
+
+    # Send audio chunks in the main thread
+    sender.send_audio(pcm_data)
+    sender.finish()
+```
+
+The CLI tool `pywhisper-client.py` demonstrates this architecture.
+
 ## Daemon Protocol
 
 `rkwhisperd` uses a v1 Unix socket protocol with Protobuf control messages and

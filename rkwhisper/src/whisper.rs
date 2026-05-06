@@ -367,18 +367,45 @@ fn fixed_audio_windows(audio_len: usize) -> Vec<AudioWindow> {
 
 fn vad_audio_windows(vad_segments: &[VadSegment]) -> Vec<AudioWindow> {
     let mut windows = Vec::new();
-    for segment in vad_segments {
-        let mut start = segment.start_sample;
-        while start < segment.end_sample {
-            let end = (start + N_SAMPLES).min(segment.end_sample);
-            windows.push(AudioWindow {
-                index: windows.len(),
-                start_sample: start,
-                end_sample: end,
-            });
-            start = end;
+    if vad_segments.is_empty() {
+        return windows;
+    }
+
+    let mut current_start = vad_segments[0].start_sample;
+    let mut current_end = vad_segments[0].end_sample;
+
+    for segment in &vad_segments[1..] {
+        if segment.end_sample - current_start <= N_SAMPLES {
+            current_end = segment.end_sample;
+        } else {
+            // Push accumulated window(s)
+            let mut start = current_start;
+            while start < current_end {
+                let end = (start + N_SAMPLES).min(current_end);
+                windows.push(AudioWindow {
+                    index: windows.len(),
+                    start_sample: start,
+                    end_sample: end,
+                });
+                start = end;
+            }
+            current_start = segment.start_sample;
+            current_end = segment.end_sample;
         }
     }
+
+    // Final accumulation
+    let mut start = current_start;
+    while start < current_end {
+        let end = (start + N_SAMPLES).min(current_end);
+        windows.push(AudioWindow {
+            index: windows.len(),
+            start_sample: start,
+            end_sample: end,
+        });
+        start = end;
+    }
+
     windows
 }
 
@@ -510,6 +537,47 @@ mod tests {
     #[test]
     fn vad_with_no_speech_has_no_windows() {
         assert!(vad_audio_windows(&[]).is_empty());
+    }
+
+    #[test]
+    fn vad_windows_accumulates_short_segments() {
+        // Two 5-second segments separated by 2 seconds of silence
+        // Combined (0-12s) should fit in one 30s window.
+        let vad_segments = vec![
+            VadSegment {
+                start_sample: 0,
+                end_sample: 16000 * 5,
+                start_sec: 0.0,
+                end_sec: 5.0,
+            },
+            VadSegment {
+                start_sample: 16000 * 7,
+                end_sample: 16000 * 12,
+                start_sec: 7.0,
+                end_sec: 12.0,
+            },
+        ];
+        let windows = vad_audio_windows(&vad_segments);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].start_sample, 0);
+        assert_eq!(windows[0].end_sample, 16000 * 12);
+    }
+
+    #[test]
+    fn vad_windows_splits_long_segments_correctly() {
+        // One 35-second segment should result in two windows.
+        let vad_segments = vec![VadSegment {
+            start_sample: 0,
+            end_sample: 16000 * 35,
+            start_sec: 0.0,
+            end_sec: 35.0,
+        }];
+        let windows = vad_audio_windows(&vad_segments);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].start_sample, 0);
+        assert_eq!(windows[0].end_sample, N_SAMPLES);
+        assert_eq!(windows[1].start_sample, N_SAMPLES);
+        assert_eq!(windows[1].end_sample, 16000 * 35);
     }
 
     #[test]

@@ -553,6 +553,12 @@ impl SharedAudioRing {
         ))
     }
 
+    pub fn attach(_fd: OwnedFd, _capacity: usize) -> Result<Self> {
+        Err(Error::Other(
+            "shared-memory daemon protocol requires Linux or FreeBSD memfd support".to_string(),
+        ))
+    }
+
     pub fn capacity(&self) -> usize {
         0
     }
@@ -565,6 +571,10 @@ impl SharedAudioRing {
 
     pub fn drain_available(&self, _out: &mut Vec<u8>) -> Result<()> {
         Ok(())
+    }
+
+    pub fn push_available(&self, _data: &[u8]) -> Result<usize> {
+        Ok(0)
     }
 }
 

@@ -155,8 +155,103 @@ pub struct PyDone {
 }
 
 #[pyclass]
+pub struct SyncAudioSender {
+    inner: client::sync::AudioSender,
+}
+
+#[pymethods]
+impl SyncAudioSender {
+    fn send_audio(&mut self, py: Python<'_>, pcm: pyo3::buffer::PyBuffer<u8>) -> PyResult<()> {
+        let slice = pcm
+            .as_slice(py)
+            .ok_or_else(|| PyRuntimeError::new_err("PCM buffer is not C-contiguous"))?;
+        let bytes = unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len()) };
+
+        py.allow_threads(|| {
+            self.inner
+                .send_audio(bytes)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn finish(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.inner
+                .finish()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn cancel(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.inner
+                .cancel()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+}
+
+#[pyclass]
+pub struct SyncResponseReceiver {
+    inner: client::sync::ResponseReceiver,
+}
+
+#[pymethods]
+impl SyncResponseReceiver {
+    fn recv_response(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        let response = py.allow_threads(|| {
+            self.inner
+                .recv_response()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+
+        match response {
+            rkwhisper_protocol::Response::Segment { text, begin, end } => {
+                Ok(Some(PySegment { text, begin, end }.into_py_any(py)?))
+            }
+            rkwhisper_protocol::Response::SpeechStarted { begin } => {
+                Ok(Some(PySpeechStarted { begin }.into_py_any(py)?))
+            }
+            rkwhisper_protocol::Response::SpeechEnded { end } => {
+                Ok(Some(PySpeechEnded { end }.into_py_any(py)?))
+            }
+            rkwhisper_protocol::Response::Done { audio_s, rtf } => {
+                Ok(Some(PyDone { audio_s, rtf }.into_py_any(py)?))
+            }
+            rkwhisper_protocol::Response::Error { error } => Err(PyRuntimeError::new_err(error)),
+            rkwhisper_protocol::Response::ServerHello(_) => {
+                Err(PyRuntimeError::new_err("unexpected server hello"))
+            }
+            rkwhisper_protocol::Response::Cancelled { .. } => {
+                Err(PyRuntimeError::new_err("session cancelled"))
+            }
+            rkwhisper_protocol::Response::BackOff { reason, .. } => {
+                Err(PyRuntimeError::new_err(format!("server backoff: {reason}")))
+            }
+        }
+    }
+
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        match self.recv_response(py) {
+            Ok(Some(obj)) => {
+                if obj.bind(py).is_instance_of::<PyDone>() {
+                    return Ok(None);
+                }
+                Ok(Some(obj))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[pyclass]
 pub struct SyncSession {
-    inner: client::sync::Session,
+    inner: Option<client::sync::Session>,
 }
 
 #[pymethods]
@@ -190,30 +285,64 @@ impl SyncSession {
         let session = client::sync::Session::connect(socket_path, hello_internal)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        Ok(Self { inner: session })
+        Ok(Self {
+            inner: Some(session),
+        })
     }
 
-    fn send_audio(&mut self, pcm: pyo3::buffer::PyBuffer<u8>) -> PyResult<()> {
-        let py = unsafe { Python::assume_gil_acquired() };
+    fn split(&mut self) -> PyResult<(SyncAudioSender, SyncResponseReceiver)> {
+        let session = self
+            .inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("session already split or closed"))?;
+        let (sender, receiver) = session
+            .split()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok((
+            SyncAudioSender { inner: sender },
+            SyncResponseReceiver { inner: receiver },
+        ))
+    }
+
+    fn send_audio(&mut self, py: Python<'_>, pcm: pyo3::buffer::PyBuffer<u8>) -> PyResult<()> {
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("session split or closed"))?;
         let slice = pcm
             .as_slice(py)
             .ok_or_else(|| PyRuntimeError::new_err("PCM buffer is not C-contiguous"))?;
         let bytes = unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len()) };
-        self.inner
-            .send_audio(bytes)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+
+        py.allow_threads(|| {
+            inner
+                .send_audio(bytes)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
     }
 
-    fn finish(&mut self) -> PyResult<()> {
-        self.inner
-            .finish()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    fn finish(&mut self, py: Python<'_>) -> PyResult<()> {
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("session split or closed"))?;
+        py.allow_threads(|| {
+            inner
+                .finish()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
     }
 
-    fn cancel(&mut self) -> PyResult<()> {
-        self.inner
-            .cancel()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    fn cancel(&mut self, py: Python<'_>) -> PyResult<()> {
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("session split or closed"))?;
+        py.allow_threads(|| {
+            inner
+                .cancel()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {
@@ -233,10 +362,9 @@ impl SyncSession {
         slf
     }
 
-    fn __next__(&mut self) -> PyResult<Option<PyObject>> {
-        match self.recv_response() {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        match self.recv_response(py) {
             Ok(Some(obj)) => {
-                let py = unsafe { Python::assume_gil_acquired() };
                 if obj.bind(py).is_instance_of::<PyDone>() {
                     return Ok(None);
                 }
@@ -247,86 +375,51 @@ impl SyncSession {
         }
     }
 
-    fn recv_response(&mut self) -> PyResult<Option<PyObject>> {
-        let py = unsafe { Python::assume_gil_acquired() };
-        match self.inner.recv_response() {
-            Ok(rkwhisper_protocol::Response::Segment { text, begin, end }) => {
+    fn recv_response(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("session split or closed"))?;
+        let response = py.allow_threads(|| {
+            inner
+                .recv_response()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+
+        match response {
+            rkwhisper_protocol::Response::Segment { text, begin, end } => {
                 Ok(Some(PySegment { text, begin, end }.into_py_any(py)?))
             }
-            Ok(rkwhisper_protocol::Response::SpeechStarted { begin }) => {
+            rkwhisper_protocol::Response::SpeechStarted { begin } => {
                 Ok(Some(PySpeechStarted { begin }.into_py_any(py)?))
             }
-            Ok(rkwhisper_protocol::Response::SpeechEnded { end }) => {
+            rkwhisper_protocol::Response::SpeechEnded { end } => {
                 Ok(Some(PySpeechEnded { end }.into_py_any(py)?))
             }
-            Ok(rkwhisper_protocol::Response::Done { audio_s, rtf }) => {
+            rkwhisper_protocol::Response::Done { audio_s, rtf } => {
                 Ok(Some(PyDone { audio_s, rtf }.into_py_any(py)?))
             }
-            Ok(rkwhisper_protocol::Response::Error { error }) => {
-                Err(PyRuntimeError::new_err(error))
-            }
-            Ok(rkwhisper_protocol::Response::ServerHello(_)) => {
+            rkwhisper_protocol::Response::Error { error } => Err(PyRuntimeError::new_err(error)),
+            rkwhisper_protocol::Response::ServerHello(_) => {
                 Err(PyRuntimeError::new_err("unexpected server hello"))
             }
-            Ok(rkwhisper_protocol::Response::Cancelled { .. }) => {
+            rkwhisper_protocol::Response::Cancelled { .. } => {
                 Err(PyRuntimeError::new_err("session cancelled"))
             }
-            Ok(rkwhisper_protocol::Response::BackOff { reason, .. }) => {
+            rkwhisper_protocol::Response::BackOff { reason, .. } => {
                 Err(PyRuntimeError::new_err(format!("server backoff: {reason}")))
             }
-            Err(e) => Err(PyRuntimeError::new_err(e.to_string())),
         }
     }
 }
 
 #[pyclass]
-pub struct AsyncSession {
-    inner: Arc<Mutex<client::asynchronous::Session>>,
+pub struct AsyncAudioSender {
+    inner: Arc<Mutex<client::asynchronous::AudioSender>>,
 }
 
 #[pymethods]
-impl AsyncSession {
-    #[staticmethod]
-    fn connect<'py>(
-        py: Python<'py>,
-        socket_path: String,
-        hello: &PyClientHello,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let hello_internal = ClientHello {
-            model: hello.model.clone(),
-            mode: hello.mode.clone(),
-            lang: hello.lang.clone(),
-            task: hello.task.clone(),
-            max_new_tokens: hello.max_new_tokens,
-            beam_size: hello.beam_size,
-            notimestamps: hello.notimestamps,
-            suppress_tokens: hello.suppress_tokens.clone(),
-            audio_format: rkwhisper_protocol::AudioFormat {
-                sample_rate: hello.audio_format.sample_rate,
-                channels: hello.audio_format.channels,
-                sample_format: hello.audio_format.sample_format,
-            },
-            vad: rkwhisper_protocol::VadOptions {
-                threshold: hello.vad.threshold,
-                min_speech_ms: hello.vad.min_speech_ms,
-                min_silence_ms: hello.vad.min_silence_ms,
-                speech_pad_ms: hello.vad.speech_pad_ms,
-                window_samples: hello.vad.window_samples,
-            },
-            client_id: hello.client_id.clone(),
-        };
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let session = client::asynchronous::Session::connect(socket_path, hello_internal)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            Ok(AsyncSession {
-                inner: Arc::new(Mutex::new(session)),
-            })
-        })
-    }
-
+impl AsyncAudioSender {
     fn send_audio<'py>(
         &self,
         py: Python<'py>,
@@ -372,7 +465,15 @@ impl AsyncSession {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })
     }
+}
 
+#[pyclass]
+pub struct AsyncResponseReceiver {
+    inner: Arc<Mutex<client::asynchronous::ResponseReceiver>>,
+}
+
+#[pymethods]
+impl AsyncResponseReceiver {
     fn recv_response<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -452,6 +553,109 @@ impl AsyncSession {
             })
         })
     }
+}
+
+#[pyclass]
+pub struct AsyncSession {
+    inner: Option<client::asynchronous::Session>,
+}
+
+#[pymethods]
+impl AsyncSession {
+    #[staticmethod]
+    fn connect<'py>(
+        py: Python<'py>,
+        socket_path: String,
+        hello: &PyClientHello,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let hello_internal = ClientHello {
+            model: hello.model.clone(),
+            mode: hello.mode.clone(),
+            lang: hello.lang.clone(),
+            task: hello.task.clone(),
+            max_new_tokens: hello.max_new_tokens,
+            beam_size: hello.beam_size,
+            notimestamps: hello.notimestamps,
+            suppress_tokens: hello.suppress_tokens.clone(),
+            audio_format: rkwhisper_protocol::AudioFormat {
+                sample_rate: hello.audio_format.sample_rate,
+                channels: hello.audio_format.channels,
+                sample_format: hello.audio_format.sample_format,
+            },
+            vad: rkwhisper_protocol::VadOptions {
+                threshold: hello.vad.threshold,
+                min_speech_ms: hello.vad.min_speech_ms,
+                min_silence_ms: hello.vad.min_silence_ms,
+                speech_pad_ms: hello.vad.speech_pad_ms,
+                window_samples: hello.vad.window_samples,
+            },
+            client_id: hello.client_id.clone(),
+        };
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let session = client::asynchronous::Session::connect(socket_path, hello_internal)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            Ok(AsyncSession {
+                inner: Some(session),
+            })
+        })
+    }
+
+    fn split(&mut self) -> PyResult<(AsyncAudioSender, AsyncResponseReceiver)> {
+        let session = self
+            .inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("session already split or closed"))?;
+        let (sender, receiver) = session.split();
+        Ok((
+            AsyncAudioSender {
+                inner: Arc::new(Mutex::new(sender)),
+            },
+            AsyncResponseReceiver {
+                inner: Arc::new(Mutex::new(receiver)),
+            },
+        ))
+    }
+
+    fn send_audio<'py>(
+        &mut self,
+        _py: Python<'py>,
+        _pcm: pyo3::buffer::PyBuffer<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Err(PyRuntimeError::new_err(
+            "send_audio on AsyncSession is deprecated; use split()",
+        ))
+    }
+
+    fn finish<'py>(&mut self, _py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Err(PyRuntimeError::new_err(
+            "finish on AsyncSession is deprecated; use split()",
+        ))
+    }
+
+    fn cancel<'py>(&mut self, _py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Err(PyRuntimeError::new_err(
+            "cancel on AsyncSession is deprecated; use split()",
+        ))
+    }
+
+    fn recv_response<'py>(&mut self, _py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Err(PyRuntimeError::new_err(
+            "recv_response on AsyncSession is deprecated; use split()",
+        ))
+    }
+
+    fn __aiter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&mut self, _py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Err(PyRuntimeError::new_err(
+            "Async iterator on AsyncSession is deprecated; use split()",
+        ))
+    }
 
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
@@ -477,7 +681,11 @@ fn rkwhisper_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySpeechStarted>()?;
     m.add_class::<PySpeechEnded>()?;
     m.add_class::<PyDone>()?;
+    m.add_class::<SyncAudioSender>()?;
+    m.add_class::<SyncResponseReceiver>()?;
     m.add_class::<SyncSession>()?;
+    m.add_class::<AsyncAudioSender>()?;
+    m.add_class::<AsyncResponseReceiver>()?;
     m.add_class::<AsyncSession>()?;
     Ok(())
 }

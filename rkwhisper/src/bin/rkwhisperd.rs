@@ -777,15 +777,27 @@ fn spawn_model_scheduler(
                                             vad.config(),
                                         );
 
-                                        if let Some(seg) = segments.first() {
-                                            let silence_threshold = vad.config().min_silence_ms as usize * 16000 / 1000;
-                                            let is_silence_gap = audio_buffer.len() - seg.end_sample >= silence_threshold;
-                                            let is_full_window = seg.end_sample - seg.start_sample >= 480000;
+                                        if let Some(first_seg) = segments.first() {
+                                            // Find the last segment that fits within 30s of the first segment's start
+                                            let mut last_fitting_idx = 0;
+                                            for (i, seg) in segments.iter().enumerate() {
+                                                if seg.end_sample - first_seg.start_sample <= 480000 {
+                                                    last_fitting_idx = i;
+                                                } else {
+                                                    break;
+                                                }
+                                            }
 
-                                            if is_silence_gap || is_full_window || (producer_closed && !audio_buffer.is_empty()) {
-                                                // Dispatch first 30s or the whole segment if it's a gap
-                                                let dispatch_end = if is_full_window { seg.start_sample + 480000 } else { seg.end_sample };
-                                                segment_to_dispatch = Some((seg.start_sample, dispatch_end));
+                                            let last_fitting_seg = &segments[last_fitting_idx];
+                                            let silence_timeout_samples = 32000; // 2 seconds
+                                            let is_timeout = audio_buffer.len() - last_fitting_seg.end_sample >= silence_timeout_samples;
+                                            let has_overflowing_segment = last_fitting_idx + 1 < segments.len();
+                                            let is_full_window = last_fitting_seg.end_sample - first_seg.start_sample >= 480000;
+
+                                            if has_overflowing_segment || is_full_window || is_timeout || (producer_closed && !audio_buffer.is_empty()) {
+                                                // Dispatch accumulated span
+                                                let dispatch_end = if is_full_window { first_seg.start_sample + 480000 } else { last_fitting_seg.end_sample };
+                                                segment_to_dispatch = Some((first_seg.start_sample, dispatch_end));
                                             }
                                         }
                                     } else {

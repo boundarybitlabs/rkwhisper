@@ -28,7 +28,9 @@ def session_factory():
 
     for s in sessions:
         try:
-            s.cancel()  # Best effort cleanup
+            # If the session was split, cancel won't work on the session object
+            # but that's okay for cleanup.
+            s.cancel() 
         except Exception:
             pass
 
@@ -49,6 +51,8 @@ async def async_session_factory():
 
     for s in sessions:
         try:
+            # AsyncSession methods now return Err if split, which future_into_py 
+            # turns into a Python exception.
             await s.cancel()
         except Exception:
             pass
