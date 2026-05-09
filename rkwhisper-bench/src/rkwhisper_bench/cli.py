@@ -287,6 +287,11 @@ def main() -> None:
         help="Beam search width (default: %(default)s; 1 = greedy)",
     )
     parser.add_argument(
+        "--notimestamps",
+        action="store_true",
+        help="Disable timestamp tokens (single-pass decoding; faster, avoids seek-loop edge cases)",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -300,7 +305,7 @@ def main() -> None:
         lang=args.lang,
         max_new_tokens=_MAX_NEW_TOKENS,
         beam_size=args.beam_size,
-        notimestamps=True,
+        notimestamps=args.notimestamps,
         vad=VadOptions(),
         client_id="rkwhisper-bench",
     )
