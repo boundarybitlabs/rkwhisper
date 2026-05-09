@@ -194,6 +194,7 @@ impl SyncAudioSender {
 #[pyclass]
 pub struct SyncResponseReceiver {
     inner: client::sync::ResponseReceiver,
+    done_received: bool,
 }
 
 #[pymethods]
@@ -236,10 +237,13 @@ impl SyncResponseReceiver {
     }
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        if self.done_received {
+            return Ok(None);
+        }
         match self.recv_response(py) {
             Ok(Some(obj)) => {
                 if obj.bind(py).is_instance_of::<PyDone>() {
-                    return Ok(None);
+                    self.done_received = true;
                 }
                 Ok(Some(obj))
             }
@@ -252,6 +256,7 @@ impl SyncResponseReceiver {
 #[pyclass]
 pub struct SyncSession {
     inner: Option<client::sync::Session>,
+    done_received: bool,
 }
 
 #[pymethods]
@@ -287,6 +292,7 @@ impl SyncSession {
 
         Ok(Self {
             inner: Some(session),
+            done_received: false,
         })
     }
 
@@ -300,7 +306,10 @@ impl SyncSession {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok((
             SyncAudioSender { inner: sender },
-            SyncResponseReceiver { inner: receiver },
+            SyncResponseReceiver {
+                inner: receiver,
+                done_received: false,
+            },
         ))
     }
 
@@ -363,10 +372,13 @@ impl SyncSession {
     }
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        if self.done_received {
+            return Ok(None);
+        }
         match self.recv_response(py) {
             Ok(Some(obj)) => {
                 if obj.bind(py).is_instance_of::<PyDone>() {
-                    return Ok(None);
+                    self.done_received = true;
                 }
                 Ok(Some(obj))
             }

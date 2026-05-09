@@ -4,28 +4,40 @@ import argparse
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import jiwer
 import numpy as np
 import soundfile as sf
-from rkwhisper_client import ClientHello, Done, Segment, SyncSession
+from rkwhisper_client import ClientHello, Done, Segment, SyncSession, VadOptions
 
 from .librispeech import Utterance, load_utterances
 
-TRANSFORM = jiwer.Compose([
-    jiwer.ToLowerCase(),
-    jiwer.RemovePunctuation(),
-    jiwer.RemoveMultipleSpaces(),
-    jiwer.Strip(),
-    jiwer.ReduceToListOfListOfWords(),
-])
+TRANSFORM = jiwer.Compose(
+    [
+        jiwer.ToLowerCase(),
+        jiwer.RemovePunctuation(),
+        jiwer.RemoveMultipleSpaces(),
+        jiwer.Strip(),
+        jiwer.ReduceToListOfListOfWords(),
+    ]
+)
+
+# No silence between concatenated utterances.  Even a short gap causes Whisper
+# to emit <|endoftext|> and stop generating for the rest of the window.
+_SILENCE_PCM: bytes = b""
+
+# Token budget per 30-second Whisper window.  The protocol default of 128 is
+# fine for a single short utterance but far too small when multiple utterances
+# are packed into one window.
+_MAX_NEW_TOKENS = 1000
 
 
 # ---------------------------------------------------------------------------
 # Audio loading
 # ---------------------------------------------------------------------------
+
 
 def load_audio_pcm(path: Path) -> tuple[bytes, float]:
     """Decode a FLAC file to 16-bit LE PCM bytes and return (pcm, duration_s)."""
@@ -43,23 +55,37 @@ def load_audio_pcm(path: Path) -> tuple[bytes, float]:
 # Transcription
 # ---------------------------------------------------------------------------
 
-def transcribe(socket_path: str, hello: ClientHello, pcm: bytes) -> tuple[str, float, float]:
-    """Connect, send audio, collect segments.
+
+def transcribe_group(
+    socket_path: str,
+    hello: ClientHello,
+    pcm_list: list[bytes],
+) -> tuple[str, float, float]:
+    """Transcribe one or more utterances concatenated as a single request.
+
+    A short silence gap is inserted between utterances so the server VAD
+    treats each as a separate speech segment.
 
     Returns:
-        hypothesis      – joined segment text (raw, un-normalised)
+        hypothesis      – full batch transcript (all segments joined)
         server_rtf      – RTF reported by the daemon in Done
-        wall_elapsed_s  – wall-clock seconds from first byte sent to Done received
+        wall_elapsed_s  – wall-clock seconds from first byte to Done
     """
+    pieces: list[bytes] = []
+    for i, pcm in enumerate(pcm_list):
+        pieces.append(pcm)
+        if i < len(pcm_list) - 1:
+            pieces.append(_SILENCE_PCM)
+    combined = b"".join(pieces)
+
     session = SyncSession.connect(socket_path, hello)
     sender, receiver = session.split()
-
     send_exc: Exception | None = None
 
     def _send() -> None:
         nonlocal send_exc
         try:
-            sender.send_audio(pcm)
+            sender.send_audio(combined)
             sender.finish()
         except Exception as e:
             send_exc = e
@@ -79,7 +105,6 @@ def transcribe(socket_path: str, hello: ClientHello, pcm: bytes) -> tuple[str, f
 
     wall_elapsed = time.monotonic() - wall_start
     t.join()
-
     if send_exc is not None:
         raise send_exc
 
@@ -89,6 +114,7 @@ def transcribe(socket_path: str, hello: ClientHello, pcm: bytes) -> tuple[str, f
 # ---------------------------------------------------------------------------
 # Per-split stats accumulator
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SplitStats:
@@ -143,12 +169,14 @@ class SplitStats:
 # Benchmark runner
 # ---------------------------------------------------------------------------
 
+
 def bench_split(
     split_dir: Path,
     socket_path: str,
     hello: ClientHello,
     limit: int | None,
     verbose: bool,
+    batch_size: int,
 ) -> SplitStats:
     utterances = list(load_utterances(split_dir))
     if limit is not None:
@@ -158,36 +186,63 @@ def bench_split(
     total = len(utterances)
     width = len(str(total))
 
-    print(f"\nBenchmarking {split_dir.name} ({total} utterances)...")
+    print(
+        f"\nBenchmarking {split_dir.name} ({total} utterances, batch_size={batch_size})..."
+    )
 
-    for i, utt in enumerate(utterances, 1):
-        prefix = f"  [{i:{width}d}/{total}] {utt.id}"
+    batch_num = 0
+    utt_cursor = 0
+    while utt_cursor < total:
+        batch_utts = utterances[utt_cursor : utt_cursor + batch_size]
+        utt_cursor += len(batch_utts)
+        batch_num += 1
+        first_id = batch_utts[0].id
+        last_id = batch_utts[-1].id
+        label = first_id if len(batch_utts) == 1 else f"{first_id}…{last_id}"
 
-        try:
-            pcm, duration = load_audio_pcm(utt.audio_path)
-        except Exception as e:
-            print(f"{prefix} ERROR (audio): {e}", file=sys.stderr)
-            stats.errors += 1
+        # Load audio for every utterance in this batch.
+        loaded: list[tuple[Utterance, bytes, float]] = []
+        for utt in batch_utts:
+            try:
+                pcm, duration = load_audio_pcm(utt.audio_path)
+                loaded.append((utt, pcm, duration))
+            except Exception as e:
+                print(f"  {label} ERROR (audio) {utt.id}: {e}", file=sys.stderr)
+                stats.errors += 1
+
+        if not loaded:
             continue
 
+        pcm_list = [pcm for _, pcm, _ in loaded]
+        dur_list = [dur for _, _, dur in loaded]
+        batch_audio_s = sum(dur_list)
+
         try:
-            hyp, server_rtf, wall_elapsed = transcribe(socket_path, hello, pcm)
+            hyp, server_rtf, wall_elapsed = transcribe_group(
+                socket_path, hello, pcm_list
+            )
         except Exception as e:
-            print(f"{prefix} ERROR (transcribe): {e}", file=sys.stderr)
-            stats.errors += 1
+            print(f"  {label} ERROR (transcribe): {e}", file=sys.stderr)
+            stats.errors += len(loaded)
             continue
 
+        # WER is computed at the batch level: concatenated reference vs full
+        # batch hypothesis.  This gives the same corpus-level metric as
+        # per-utterance processing, and avoids the need to attribute Whisper
+        # segments back to individual utterances.
+        ref = " ".join(utt.reference for utt, _, _ in loaded)
         result = jiwer.process_words(
-            utt.reference,
+            ref,
             hyp,
             reference_transform=TRANSFORM,
             hypothesis_transform=TRANSFORM,
         )
 
-        utt_ref_words = result.hits + result.substitutions + result.deletions
-        utt_wer = (
-            (result.substitutions + result.deletions + result.insertions) / utt_ref_words
-            if utt_ref_words > 0
+        batch_ref_words = result.hits + result.substitutions + result.deletions
+        batch_wer = (
+            (result.substitutions + result.deletions + result.insertions)
+            / batch_ref_words
+            if batch_ref_words > 0
             else 0.0
         )
 
@@ -195,13 +250,18 @@ def bench_split(
         stats.substitutions += result.substitutions
         stats.deletions += result.deletions
         stats.insertions += result.insertions
-        stats.total_audio_s += duration
+        stats.total_audio_s += batch_audio_s
         stats.total_wall_s += wall_elapsed
-        stats.total_server_processing_s += server_rtf * duration
+        stats.total_server_processing_s += server_rtf * batch_audio_s
 
-        print(f"{prefix} | WER: {utt_wer:5.1%} | RTF: {server_rtf:.3f} | {duration:.1f}s")
+        n = len(loaded)
+        ids_label = f"{first_id}" if n == 1 else f"{first_id}…{last_id} ({n} utts)"
+        print(
+            f"  [batch {batch_num:>{width}}] {ids_label}"
+            f" | WER: {batch_wer:5.1%} | RTF: {server_rtf:.3f} | {batch_audio_s:.1f}s"
+        )
         if verbose:
-            ref_norm = " ".join(TRANSFORM([utt.reference])[0])
+            ref_norm = " ".join(TRANSFORM([ref])[0])
             hyp_norm = " ".join(TRANSFORM([hyp])[0]) if hyp.strip() else "(empty)"
             print(f"    REF: {ref_norm}")
             print(f"    HYP: {hyp_norm}")
@@ -212,6 +272,7 @@ def bench_split(
 # ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
+
 
 def print_summary(stats: SplitStats) -> None:
     hours = stats.total_audio_s / 3600.0
@@ -234,6 +295,7 @@ def print_summary(stats: SplitStats) -> None:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -267,10 +329,37 @@ def main() -> None:
         help="Process only the first N utterances per split",
     )
     parser.add_argument(
+        "--no-vad",
+        action="store_true",
+        help=(
+            "Disable server-side VAD by setting threshold=2.0, forcing fixed 30 s windows. "
+            "Recommended when batching utterances, as the VAD may drop short utterances "
+            "in concatenated audio."
+        ),
+    )
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Beam search width (default: %(default)s; 1 = greedy)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=9,
+        metavar="N",
+        help=(
+            "Utterances per request (default: %(default)s). "
+            "At ~10 s/utterance, 9 utterances ≈ 90 s ≈ 3 windows, "
+            "fully utilising all three NPU cores on RK3588."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
-        help="Print normalised REF and HYP for each utterance",
+        help="Print normalised REF and HYP for each batch",
     )
     args = parser.parse_args()
 
@@ -278,6 +367,10 @@ def main() -> None:
         model=args.model,
         mode="batch",
         lang=args.lang,
+        max_new_tokens=_MAX_NEW_TOKENS,
+        beam_size=args.beam_size,
+        notimestamps=True,
+        vad=VadOptions(threshold=2.0) if args.no_vad else VadOptions(),
         client_id="rkwhisper-bench",
     )
 
@@ -289,7 +382,9 @@ def main() -> None:
             print(f"ERROR: {path} is not a directory", file=sys.stderr)
             sys.exit(1)
 
-        stats = bench_split(path, args.socket, hello, args.limit, args.verbose)
+        stats = bench_split(
+            path, args.socket, hello, args.limit, args.verbose, args.batch_size
+        )
         print_summary(stats)
         all_stats.append(stats)
 

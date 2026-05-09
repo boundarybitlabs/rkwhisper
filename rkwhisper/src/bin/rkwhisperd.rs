@@ -683,14 +683,20 @@ fn spawn_model_scheduler(
                                                 audio_buffer.extend_from_slice(&c.samples);
 
                                                 if let (Some(vad), Some(v_model)) = (&mut streaming_vad, &vad_model) {
-                                                    let prob = match vad.process_window(v_model, &c.samples) {
-                                                        Ok(p) => p,
-                                                        Err(e) => {
-                                                            let _ = response_tx.send(JobResponse::Finished(Err(e)));
-                                                            return;
-                                                        }
-                                                    };
-                                                    probs.push((start_idx, prob));
+                                                    let win = vad.config().window_samples;
+                                                    let mut offset = 0;
+                                                    while offset < c.samples.len() {
+                                                        let end = (offset + win).min(c.samples.len());
+                                                        let prob = match vad.process_window(v_model, &c.samples[offset..end]) {
+                                                            Ok(p) => p,
+                                                            Err(e) => {
+                                                                let _ = response_tx.send(JobResponse::Finished(Err(e)));
+                                                                return;
+                                                            }
+                                                        };
+                                                        probs.push((start_idx + offset, prob));
+                                                        offset += win;
+                                                    }
                                                 }
                                             }
                                             Some(Err(e)) => {
@@ -847,7 +853,14 @@ fn spawn_model_scheduler(
                     } => {
                         let segment_tx = response_tx.clone();
                         let vad_segments = if let Some(v_model) = &vad_model {
-                            v_model.segments(&audio).unwrap_or_default()
+                            let vad_config = rkwhisper::vad::VadConfig {
+                                threshold: header.vad_threshold.unwrap_or(0.5),
+                                min_speech_ms: header.vad_min_speech_ms.unwrap_or(250),
+                                min_silence_ms: header.vad_min_silence_ms.unwrap_or(100),
+                                speech_pad_ms: header.vad_speech_pad_ms.unwrap_or(200),
+                                window_samples: header.vad_window_samples.unwrap_or(512),
+                            };
+                            v_model.segments_with_config(&audio, &vad_config).unwrap_or_default()
                         } else {
                             Vec::new()
                         };

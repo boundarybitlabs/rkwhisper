@@ -48,16 +48,20 @@ impl VadModel {
     }
 
     pub fn segments(&self, audio: &[f32]) -> Result<Vec<VadSegment>> {
+        self.segments_with_config(audio, &self.config)
+    }
+
+    pub fn segments_with_config(&self, audio: &[f32], config: &VadConfig) -> Result<Vec<VadSegment>> {
         let mut probs = Vec::new();
         let mut state = vec![0.0f32; 2 * 128];
-        for start in (0..audio.len()).step_by(self.config.window_samples) {
-            let end = (start + self.config.window_samples).min(audio.len());
+        for start in (0..audio.len()).step_by(config.window_samples) {
+            let end = (start + config.window_samples).min(audio.len());
             probs.push((
                 start,
                 self.speech_probability(&audio[start..end], &mut state)?,
             ));
         }
-        Ok(segments_from_probs(audio.len(), &probs, &self.config))
+        Ok(segments_from_probs(audio.len(), &probs, config))
     }
 
     pub fn speech_probability(&self, window: &[f32], state: &mut [f32]) -> Result<f32> {
