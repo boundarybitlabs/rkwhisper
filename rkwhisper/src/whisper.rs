@@ -238,94 +238,156 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
 
     decoder.set_enc_kv(enc_k, enc_v);
 
-    let prompt = control_prompt(
+    let tok_eot = S::TOKEN_EOT;
+    let tok_notimestamps = tokenizer.token_to_id("<|notimestamps|>").unwrap();
+    let timestamp_begin = tok_notimestamps + 1;
+    let window_duration_sec = samples_to_sec(window_end_sample - window_start_sample);
+
+    // Base prompt without seek position: <|sot|> <|lang|> <|task|> [<|notimestamps|>]
+    let base_prompt = control_prompt(
         tokenizer,
         &options.lang,
         &options.task,
         options.notimestamps,
     )?;
-
-    state.reset();
-    let mut last_logits = vec![0f32; S::VOCAB];
-    for (i, &id) in prompt.iter().enumerate() {
-        last_logits = decoder
-            .step(&mut state, id)
-            .map_err(|e| anyhow!("prime step {i} failed on window {window_index}: {e}"))?;
-    }
-
-    let tok_eot = S::TOKEN_EOT;
-    let tok_notimestamps = tokenizer.token_to_id("<|notimestamps|>").unwrap();
-    let prompt_len = prompt.len();
     let suppressor = TokenSuppressor::new::<S>(
         tokenizer,
-        prompt_len,
+        base_prompt.len(),
         options.notimestamps,
         &options.suppress_tokens,
     )?;
     let suppress_fn = |tokens: &[u32], logits: &mut [f32]| suppressor.apply(tokens, logits);
 
-    let mut generated: Vec<u32>;
+    // In notimestamps mode the whole window is one pass.  In timestamp mode we
+    // loop: each iteration decodes one segment, then re-enters the decoder with
+    // the segment's end timestamp as the new seek position, until the seek
+    // pointer advances past the window duration or the model signals no speech.
+    let mut all_output_tokens: Vec<u32> = Vec::new();
+    let mut seek_sec: f32 = 0.0;
 
-    if options.beam_size > 1 {
-        let mut beam_search = BeamSearch::<S>::new(
-            options.beam_size,
-            state.clone(),
-            last_logits,
-            prompt.clone(),
-            1.0, // Alpha 1.0: standard length normalization for Whisper
-        );
-        for _ in 0..options.max_new_tokens {
-            beam_search.step(decoder, &suppress_fn)?;
-            if beam_search.beams.is_empty() {
-                break;
-            }
+    loop {
+        // Build the prompt for this iteration.  In timestamp mode, after the
+        // first segment, prepend the seek timestamp so the decoder knows where
+        // in the audio it is picking up.
+        let prompt = if !options.notimestamps && seek_sec > 0.0 {
+            let mut p = base_prompt.clone();
+            p.push(sec_to_timestamp_token(seek_sec, timestamp_begin));
+            p
+        } else {
+            base_prompt.clone()
+        };
+
+        // Prime the decoder with the prompt tokens.
+        state.reset();
+        let mut last_logits = vec![0f32; S::VOCAB];
+        for (i, &id) in prompt.iter().enumerate() {
+            last_logits = decoder
+                .step(&mut state, id)
+                .map_err(|e| anyhow!("prime step {i} failed on window {window_index}: {e}"))?;
         }
-        generated = beam_search.best_result().unwrap_or_default();
-    } else {
-        generated = Vec::new();
-        let mut current_logits = last_logits;
-        let mut tokens_with_prompt = prompt.clone();
 
-        for _step in 0..options.max_new_tokens {
-            let mut logits_1d = current_logits.clone();
-            suppress_fn(&tokens_with_prompt, &mut logits_1d);
-
-            let token_id = argmax_token(&logits_1d);
-            if token_id == tok_eot {
-                break;
-            }
-
-            generated.push(token_id);
-            tokens_with_prompt.push(token_id);
-
-            if generated.len() >= 8 {
-                let tail = &generated[generated.len() - 8..];
-                if tail[0..4] == tail[4..8] {
+        // Decode one segment (greedy or beam).
+        let segment_tokens: Vec<u32> = if options.beam_size > 1 {
+            let mut beam_search = BeamSearch::<S>::new(
+                options.beam_size,
+                state.clone(),
+                last_logits,
+                prompt.clone(),
+                1.0,
+            );
+            for _ in 0..options.max_new_tokens {
+                beam_search.step(decoder, &suppress_fn)?;
+                if beam_search.beams.is_empty() {
                     break;
                 }
             }
+            let full = beam_search.best_result().unwrap_or_default();
+            full.get(prompt.len()..).unwrap_or(&[]).to_vec()
+        } else {
+            let mut generated = Vec::new();
+            let mut current_logits = last_logits;
+            let mut tokens_with_prompt = prompt.clone();
 
-            current_logits = decoder
-                .step(&mut state, token_id)
-                .map_err(|e| anyhow!("decoder step failed on window {window_index}: {e}"))?;
+            for _step in 0..options.max_new_tokens {
+                let mut logits_1d = current_logits.clone();
+                suppress_fn(&tokens_with_prompt, &mut logits_1d);
+
+                let token_id = argmax_token(&logits_1d);
+                if token_id == tok_eot {
+                    break;
+                }
+
+                generated.push(token_id);
+                tokens_with_prompt.push(token_id);
+
+                if generated.len() >= 8 {
+                    let tail = &generated[generated.len() - 8..];
+                    if tail[0..4] == tail[4..8] {
+                        break;
+                    }
+                }
+
+                current_logits = decoder
+                    .step(&mut state, token_id)
+                    .map_err(|e| anyhow!("decoder step failed on window {window_index}: {e}"))?;
+            }
+            generated
+        };
+
+        // In notimestamps mode there is only ever one pass.
+        if options.notimestamps {
+            all_output_tokens.extend_from_slice(&segment_tokens);
+            break;
         }
-    }
 
-    let output_tokens = if options.beam_size > 1 {
-        generated.get(prompt.len()..).unwrap_or(&[])
-    } else {
-        &generated
-    };
+        // In timestamp mode, find the last timestamp token in this segment.
+        // It tells us how far through the audio the model has read.
+        let last_ts = segment_tokens
+            .iter()
+            .rev()
+            .find(|&&t| t >= timestamp_begin)
+            .copied();
+
+        let new_seek = match last_ts {
+            // No timestamp emitted → model gave up, take what we have and stop.
+            None => {
+                all_output_tokens.extend_from_slice(&segment_tokens);
+                break;
+            }
+            Some(ts) => timestamp_token_to_sec(ts, timestamp_begin),
+        };
+
+        trace!(
+            window_index,
+            seek_sec,
+            new_seek,
+            segment_tokens = segment_tokens.len(),
+            "timestamp segment complete"
+        );
+
+        // No forward progress: the model repeated itself (seek didn't advance).
+        // Discard these tokens rather than appending duplicates.
+        if new_seek <= seek_sec + 0.02 {
+            break;
+        }
+
+        all_output_tokens.extend_from_slice(&segment_tokens);
+
+        // Stop if we've reached or exceeded the window boundary, or if less
+        // than 1 s remains — not worth re-entering the decoder for trailing
+        // silence where the model tends to hallucinate or repeat.
+        if new_seek >= window_duration_sec || window_duration_sec - new_seek < 1.0 {
+            break;
+        }
+
+        seek_sec = new_seek;
+    }
 
     state.reset();
 
     // Log raw token sequence at trace level so we can diagnose skipping.
     if tracing::enabled!(tracing::Level::TRACE) {
-        let tok_notimestamps_id = tokenizer
-            .token_to_id("<|notimestamps|>")
-            .unwrap_or(u32::MAX);
-        let timestamp_begin = tok_notimestamps_id + 1;
-        let token_summary: Vec<String> = output_tokens
+        let token_summary: Vec<String> = all_output_tokens
             .iter()
             .map(|&t| {
                 if t >= timestamp_begin {
@@ -338,30 +400,30 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
         trace!(
             window_index,
             start_sec = absolute_start_sec,
-            end_sec = absolute_start_sec + samples_to_sec(window_end_sample - window_start_sample),
-            token_count = output_tokens.len(),
+            end_sec = absolute_start_sec + window_duration_sec,
+            token_count = all_output_tokens.len(),
             tokens = %token_summary.join(" "),
             "window tokens"
         );
     }
 
-    let text = tokenizer.decode(output_tokens, true).unwrap();
+    let text = tokenizer.decode(&all_output_tokens, true).unwrap();
     debug!(
         window_index,
         start_sec = absolute_start_sec,
-        end_sec = absolute_start_sec + samples_to_sec(window_end_sample - window_start_sample),
-        token_count = output_tokens.len(),
+        end_sec = absolute_start_sec + window_duration_sec,
+        token_count = all_output_tokens.len(),
         notimestamps = options.notimestamps,
         %text,
         "window transcribed"
     );
     let segments = tokens_to_segments(
         tokenizer,
-        output_tokens,
+        &all_output_tokens,
         window_index,
         absolute_start_sec,
-        absolute_start_sec + samples_to_sec(window_end_sample - window_start_sample),
-        tok_notimestamps + 1,
+        absolute_start_sec + window_duration_sec,
+        timestamp_begin,
     );
 
     Ok(WindowTranscription {
@@ -524,6 +586,11 @@ fn tokens_to_segments(
 #[inline]
 fn timestamp_token_to_sec(token: u32, timestamp_begin: u32) -> f32 {
     (token - timestamp_begin) as f32 * 0.02
+}
+
+#[inline]
+fn sec_to_timestamp_token(sec: f32, timestamp_begin: u32) -> u32 {
+    timestamp_begin + (sec / 0.02).round() as u32
 }
 
 /// Simple greedy argmax over logits.
