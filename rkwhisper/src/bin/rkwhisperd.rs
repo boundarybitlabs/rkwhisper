@@ -618,12 +618,13 @@ fn spawn_model_scheduler(
                         let mut audio_buffer = Vec::new();
                         let mut absolute_offset_samples = 0usize;
                         let mut streaming_vad = vad_model.as_ref().map(|_m| {
+                            let defaults = rkwhisper::vad::VadConfig::default();
                             rkwhisper::vad::StreamingVad::new(rkwhisper::vad::VadConfig {
-                                threshold: header.vad_threshold.unwrap_or(0.5),
-                                min_speech_ms: header.vad_min_speech_ms.unwrap_or(250),
-                                min_silence_ms: header.vad_min_silence_ms.unwrap_or(100),
-                                speech_pad_ms: header.vad_speech_pad_ms.unwrap_or(200),
-                                window_samples: header.vad_window_samples.unwrap_or(512),
+                                threshold: header.vad_threshold.unwrap_or(defaults.threshold),
+                                min_speech_ms: header.vad_min_speech_ms.unwrap_or(defaults.min_speech_ms),
+                                min_silence_ms: header.vad_min_silence_ms.unwrap_or(defaults.min_silence_ms),
+                                speech_pad_ms: header.vad_speech_pad_ms.unwrap_or(defaults.speech_pad_ms),
+                                window_samples: header.vad_window_samples.unwrap_or(defaults.window_samples),
                             })
                         });
 
@@ -872,12 +873,13 @@ fn spawn_model_scheduler(
                             "batch job received"
                         );
                         let vad_segments = if let Some(v_model) = &vad_model {
+                            let defaults = rkwhisper::vad::VadConfig::default();
                             let vad_config = rkwhisper::vad::VadConfig {
-                                threshold: header.vad_threshold.unwrap_or(0.5),
-                                min_speech_ms: header.vad_min_speech_ms.unwrap_or(250),
-                                min_silence_ms: header.vad_min_silence_ms.unwrap_or(100),
-                                speech_pad_ms: header.vad_speech_pad_ms.unwrap_or(200),
-                                window_samples: header.vad_window_samples.unwrap_or(512),
+                                threshold: header.vad_threshold.unwrap_or(defaults.threshold),
+                                min_speech_ms: header.vad_min_speech_ms.unwrap_or(defaults.min_speech_ms),
+                                min_silence_ms: header.vad_min_silence_ms.unwrap_or(defaults.min_silence_ms),
+                                speech_pad_ms: header.vad_speech_pad_ms.unwrap_or(defaults.speech_pad_ms),
+                                window_samples: header.vad_window_samples.unwrap_or(defaults.window_samples),
                             };
                             let segs = v_model.segments_with_config(&audio, &vad_config).unwrap_or_default();
                             debug!(vad_segments = segs.len(), "VAD segmentation complete");

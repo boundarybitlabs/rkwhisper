@@ -23,7 +23,7 @@ impl Default for VadConfig {
             threshold: 0.5,
             min_speech_ms: 250,
             min_silence_ms: 100,
-            speech_pad_ms: 200,
+            speech_pad_ms: 100,
             window_samples: 512,
         }
     }
