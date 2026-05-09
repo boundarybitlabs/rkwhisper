@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Remove the system user/group on purge only.
+        if getent passwd rkwhisper > /dev/null 2>&1; then
+            deluser --system rkwhisper || true
+        fi
+        if getent group rkwhisper > /dev/null 2>&1; then
+            delgroup --system rkwhisper || true
+        fi
+        # Remove config (conf-files are only removed on purge).
+        rm -rf /etc/rkwhisper.toml
+        ;;
+esac
+
+#DEBHELPER#

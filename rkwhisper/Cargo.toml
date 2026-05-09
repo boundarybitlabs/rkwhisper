@@ -17,3 +17,26 @@ tokio = { version = "1", features = ["macros", "rt", "sync"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[package.metadata.deb]
+name = "rkwhisperd"
+maintainer = "Boyd Johnson <johnson.boyd@gmail.com>"
+copyright = "2024, Boyd Johnson"
+extended-description = """\
+RKWhisper ASR daemon — runs OpenAI Whisper models on the Rockchip RK3588 NPU \
+and exposes transcription via a Unix domain socket at /run/rkwhisper/asr.sock."""
+depends = "$auto"
+section = "sound"
+priority = "optional"
+# Pre-create the system user; adduser is present on all Debian/Ubuntu systems.
+maintainer-scripts = "debian/maintainer-scripts"
+assets = [
+    ["target/release/rkwhisperd", "usr/sbin/rkwhisperd", "755"],
+    ["debian/rkwhisper.toml", "etc/rkwhisper.toml", "644"],
+]
+conf-files = ["/etc/rkwhisper.toml"]
+
+[package.metadata.deb.systemd-units]
+unit-scripts = "debian"
+enable = true
+start = true
