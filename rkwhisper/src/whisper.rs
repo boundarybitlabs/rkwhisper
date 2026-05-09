@@ -8,6 +8,7 @@ use crate::{MelSpectrogram, N_SAMPLES, load_audio_file};
 use anyhow::{Result, anyhow};
 use serde::Serialize;
 use tokenizers::Tokenizer;
+use tracing::{debug, trace};
 
 #[derive(Clone, Debug)]
 pub struct TranscribeOptions {
@@ -317,7 +318,43 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
     };
 
     state.reset();
+
+    // Log raw token sequence at trace level so we can diagnose skipping.
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let tok_notimestamps_id = tokenizer
+            .token_to_id("<|notimestamps|>")
+            .unwrap_or(u32::MAX);
+        let timestamp_begin = tok_notimestamps_id + 1;
+        let token_summary: Vec<String> = output_tokens
+            .iter()
+            .map(|&t| {
+                if t >= timestamp_begin {
+                    format!("<|{:.2}|>", timestamp_token_to_sec(t, timestamp_begin))
+                } else {
+                    format!("{t}")
+                }
+            })
+            .collect();
+        trace!(
+            window_index,
+            start_sec = absolute_start_sec,
+            end_sec = absolute_start_sec + samples_to_sec(window_end_sample - window_start_sample),
+            token_count = output_tokens.len(),
+            tokens = %token_summary.join(" "),
+            "window tokens"
+        );
+    }
+
     let text = tokenizer.decode(output_tokens, true).unwrap();
+    debug!(
+        window_index,
+        start_sec = absolute_start_sec,
+        end_sec = absolute_start_sec + samples_to_sec(window_end_sample - window_start_sample),
+        token_count = output_tokens.len(),
+        notimestamps = options.notimestamps,
+        %text,
+        "window transcribed"
+    );
     let segments = tokens_to_segments(
         tokenizer,
         output_tokens,

@@ -30,6 +30,7 @@ use std::time::Instant;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tracing::{debug, trace};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "RKWhisper Unix socket ASR daemon")]
@@ -48,6 +49,14 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let args = Args::parse();
     let model_root = args.model_root.unwrap_or_else(default_model_root);
     let config = load_config(&args.config)?;
@@ -852,6 +861,16 @@ fn spawn_model_scheduler(
                         response_tx,
                     } => {
                         let segment_tx = response_tx.clone();
+                        let audio_samples = audio.len();
+                        let audio_sec = audio_samples as f32 / rkwhisper::SAMPLE_RATE as f32;
+                        debug!(
+                            audio_samples,
+                            audio_sec,
+                            notimestamps = header.notimestamps,
+                            max_new_tokens = header.max_new_tokens,
+                            vad_threshold = ?header.vad_threshold,
+                            "batch job received"
+                        );
                         let vad_segments = if let Some(v_model) = &vad_model {
                             let vad_config = rkwhisper::vad::VadConfig {
                                 threshold: header.vad_threshold.unwrap_or(0.5),
@@ -860,8 +879,14 @@ fn spawn_model_scheduler(
                                 speech_pad_ms: header.vad_speech_pad_ms.unwrap_or(200),
                                 window_samples: header.vad_window_samples.unwrap_or(512),
                             };
-                            v_model.segments_with_config(&audio, &vad_config).unwrap_or_default()
+                            let segs = v_model.segments_with_config(&audio, &vad_config).unwrap_or_default();
+                            debug!(vad_segments = segs.len(), "VAD segmentation complete");
+                            for (i, seg) in segs.iter().enumerate() {
+                                trace!(i, start_sec = seg.start_sec, end_sec = seg.end_sec, "VAD segment");
+                            }
+                            segs
                         } else {
+                            debug!("no VAD model; using fixed windows");
                             Vec::new()
                         };
 
@@ -877,6 +902,12 @@ fn spawn_model_scheduler(
                             &audio,
                             &vad_segments,
                             |segment| {
+                                debug!(
+                                    start_sec = segment.start_sec,
+                                    end_sec = segment.end_sec,
+                                    text = %segment.text,
+                                    "batch segment emitted"
+                                );
                                 segment_tx
                                     .try_send(JobResponse::Segment {
                                         text: segment.text.clone(),

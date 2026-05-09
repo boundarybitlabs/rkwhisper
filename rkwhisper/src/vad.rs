@@ -51,7 +51,11 @@ impl VadModel {
         self.segments_with_config(audio, &self.config)
     }
 
-    pub fn segments_with_config(&self, audio: &[f32], config: &VadConfig) -> Result<Vec<VadSegment>> {
+    pub fn segments_with_config(
+        &self,
+        audio: &[f32],
+        config: &VadConfig,
+    ) -> Result<Vec<VadSegment>> {
         let mut probs = Vec::new();
         let mut state = vec![0.0f32; 2 * 128];
         for start in (0..audio.len()).step_by(config.window_samples) {
