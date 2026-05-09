@@ -9,6 +9,7 @@
 import argparse
 import sys
 import wave
+import threading
 from pathlib import Path
 from rkwhisper_client import SyncSession, ClientHello, VadOptions, Segment, Done, SpeechStarted, SpeechEnded
 
@@ -64,48 +65,87 @@ def main() -> int:
 
     try:
         with SyncSession.connect(args.socket, hello) as session:
-            # 1. Start audio producer thread or loop
             pcm_data = read_wav_s16le(args.wav)
             
             if args.mode == "batch":
                 session.send_audio(pcm_data)
                 session.finish()
+
+                # 2. Consume results
+                transcript_parts = []
+                for resp in session:
+                    if isinstance(resp, Segment):
+                        if args.text:
+                            transcript_parts.append(resp.text)
+                        else:
+                            print({
+                                "type": "segment",
+                                "text": resp.text,
+                                "begin": resp.begin,
+                                "end": resp.end
+                            }, flush=True)
+                    elif isinstance(resp, SpeechStarted):
+                        if not args.text:
+                            print({"type": "speech_started", "begin": resp.begin}, flush=True)
+                    elif isinstance(resp, SpeechEnded):
+                        if not args.text:
+                            print({"type": "speech_ended", "end": resp.end}, flush=True)
+                    elif isinstance(resp, Done):
+                        if not args.text:
+                            print({
+                                "type": "done",
+                                "audio_s": resp.audio_s,
+                                "rtf": resp.rtf
+                            }, flush=True)
+
+                if args.text and transcript_parts:
+                    print(" ".join(transcript_parts).strip())
             else:
+                # In stream mode, split and use a background thread for responses
+                sender, receiver = session.split()
+                transcript_parts = []
+
+                def receiver_thread():
+                    for resp in receiver:
+                        if isinstance(resp, Segment):
+                            if args.text:
+                                transcript_parts.append(resp.text)
+                            else:
+                                print({
+                                    "type": "segment",
+                                    "text": resp.text,
+                                    "begin": resp.begin,
+                                    "end": resp.end
+                                }, flush=True)
+                        elif isinstance(resp, SpeechStarted):
+                            if not args.text:
+                                print({"type": "speech_started", "begin": resp.begin}, flush=True)
+                        elif isinstance(resp, SpeechEnded):
+                            if not args.text:
+                                print({"type": "speech_ended", "end": resp.end}, flush=True)
+                        elif isinstance(resp, Done):
+                            if not args.text:
+                                print({
+                                    "type": "done",
+                                    "audio_s": resp.audio_s,
+                                    "rtf": resp.rtf
+                                }, flush=True)
+
+                t = threading.Thread(target=receiver_thread, daemon=True)
+                t.start()
+
                 # In stream mode, send in chunks
                 chunk_size = (16000 * 2 * args.frame_ms) // 1000
                 for i in range(0, len(pcm_data), chunk_size):
-                    session.send_audio(pcm_data[i:i+chunk_size])
-                session.finish()
+                    sender.send_audio(pcm_data[i:i+chunk_size])
+                
+                sender.finish()
+                
+                # Wait for receiver thread to finish
+                t.join()
 
-            # 2. Consume results
-            transcript_parts = []
-            for resp in session:
-                if isinstance(resp, Segment):
-                    if args.text:
-                        transcript_parts.append(resp.text)
-                    else:
-                        print({
-                            "type": "segment",
-                            "text": resp.text,
-                            "begin": resp.begin,
-                            "end": resp.end
-                        }, flush=True)
-                elif isinstance(resp, SpeechStarted):
-                    if not args.text:
-                        print({"type": "speech_started", "begin": resp.begin}, flush=True)
-                elif isinstance(resp, SpeechEnded):
-                    if not args.text:
-                        print({"type": "speech_ended", "end": resp.end}, flush=True)
-                elif isinstance(resp, Done):
-                    if not args.text:
-                        print({
-                            "type": "done",
-                            "audio_s": resp.audio_s,
-                            "rtf": resp.rtf
-                        }, flush=True)
-
-            if args.text and transcript_parts:
-                print(" ".join(transcript_parts).strip())
+                if args.text and transcript_parts:
+                    print(" ".join(transcript_parts).strip())
                 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

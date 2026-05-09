@@ -19,13 +19,14 @@ Verify the correctness and performance of the `rkwhisper-client` Python package 
 
 ### B. Inference & Accuracy (End-to-End)
 *   **Basic Transcription**: Stream `jfkwha-001.wav` to the daemon; verify the returned text contains expected keywords (e.g., "And so my fellow Americans").
-*   **Streaming Mode**: Use `mode="stream"` and verify that segments are yielded incrementally as the audio is sent.
+*   **Streaming Mode**: Use `mode="stream"` and the `split()` API. Verify that segments are received in a background thread or task while the main task continues sending audio.
 *   **Batch Mode**: Use `mode="batch"` and verify the behavior matches the protocol's batch expectations.
 
 ### C. Protocol Robustness
+*   **Concurrent Send/Receive**: Verify that sending audio and receiving responses can happen simultaneously without deadlock by using the `split()` API.
 *   **Ring Buffer Streaming**: Stream a large amount of audio to ensure the ring buffer logic correctly handles multiple wraps and `SIGNAL_DATA_READY` notifications.
-*   **Cancellation**: Start an inference and immediately call `client.cancel()`; verify the daemon reports `Cancelled` and stops processing.
-*   **Finish/EOF**: Verify that `client.finish()` correctly triggers the final transcription and the session closes cleanly.
+*   **Cancellation**: Start an inference and immediately call `sender.cancel()`; verify the daemon reports `Cancelled` and stops processing.
+*   **Finish/EOF**: Verify that `sender.finish()` correctly triggers the final transcription and the session closes cleanly.
 
 ### D. Parameter Verification
 *   **Language/Task**: Verify that passing different `lang` (e.g., "fr") or `task` ("translate") parameters works as expected.

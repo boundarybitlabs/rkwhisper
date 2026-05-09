@@ -1,6 +1,7 @@
 import pytest
 import wave
 import os
+import threading
 from pathlib import Path
 from rkwhisper_client import ClientHello
 
@@ -20,6 +21,7 @@ def stream_hello():
 def test_transcribe_audio(session_factory, stream_hello):
     """End-to-end transcription test using a sample from fixtures."""
     session = session_factory(stream_hello)
+    sender, receiver = session.split()
     
     assert WAV_PATH is not None, f"No .wav fixtures found in {FIXTURES_DIR}"
     assert WAV_PATH.exists(), f"Test audio not found at {WAV_PATH}"
@@ -35,26 +37,32 @@ def test_transcribe_audio(session_factory, stream_hello):
     max_bytes = 16000 * 2 * 10
     pcm_data = pcm_data[:max_bytes]
 
-    # Send audio in chunks to simulate streaming
-    chunk_size = 16000 * 2  # 1 second of audio
-    for i in range(0, len(pcm_data), chunk_size):
-        session.send_audio(pcm_data[i : i + chunk_size])
-
-    session.finish()
-
     results = []
     speech_started = False
     speech_ended = False
 
     from rkwhisper_client import Segment, SpeechStarted, SpeechEnded
 
-    for resp in session:
-        if isinstance(resp, Segment):
-            results.append(resp.text)
-        elif isinstance(resp, SpeechStarted):
-            speech_started = True
-        elif isinstance(resp, SpeechEnded):
-            speech_ended = True
+    def receiver_thread():
+        nonlocal speech_started, speech_ended
+        for resp in receiver:
+            if isinstance(resp, Segment):
+                results.append(resp.text)
+            elif isinstance(resp, SpeechStarted):
+                speech_started = True
+            elif isinstance(resp, SpeechEnded):
+                speech_ended = True
+
+    t = threading.Thread(target=receiver_thread, daemon=True)
+    t.start()
+
+    # Send audio in chunks to simulate streaming
+    chunk_size = 16000 * 2  # 1 second of audio
+    for i in range(0, len(pcm_data), chunk_size):
+        sender.send_audio(pcm_data[i : i + chunk_size])
+
+    sender.finish()
+    t.join()
 
     full_text = " ".join(results).lower()
     print(f"Transcribed text: {full_text}")

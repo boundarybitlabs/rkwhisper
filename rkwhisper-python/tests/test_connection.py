@@ -51,3 +51,20 @@ def test_connect_retry_on_busy(session_factory, client_hello):
         pass
     for _ in retry_session:
         pass
+
+def test_split_session(session):
+    """Verify that splitting a session works and the halves are independent."""
+    sender, receiver = session.split()
+    
+    # Verify session methods now raise an error
+    with pytest.raises(RuntimeError) as excinfo:
+        session.send_audio(b"\x00\x00")
+    assert "split or closed" in str(excinfo.value)
+    
+    # Use sender and receiver
+    sender.send_audio(b"\x00\x00" * 1600)
+    sender.finish()
+    
+    # Drain receiver
+    for _ in receiver:
+        pass
