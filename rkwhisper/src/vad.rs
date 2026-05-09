@@ -242,4 +242,97 @@ mod tests {
         let segments = segments_from_probs(1000, &probs, &config);
         assert!(segments.is_empty());
     }
+
+    // Speech that ends with the final prob window (no trailing silence) must still
+    // be captured — the post-loop flush must fire.
+    #[test]
+    fn captures_speech_at_end_of_audio_with_no_trailing_silence() {
+        let config = VadConfig {
+            threshold: 0.5,
+            min_speech_ms: 10,
+            min_silence_ms: 100,
+            speech_pad_ms: 0,
+            window_samples: 160,
+        };
+        let probs = vec![(0, 0.0), (160, 0.9), (320, 0.9)];
+        let audio_len = 480;
+        let segments = segments_from_probs(audio_len, &probs, &config);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_sample, 160);
+        assert_eq!(segments[0].end_sample, audio_len);
+    }
+
+    // A single window of speech at position 0 must produce a segment.
+    #[test]
+    fn captures_single_speech_window_at_start() {
+        let config = VadConfig {
+            threshold: 0.5,
+            min_speech_ms: 10,
+            min_silence_ms: 200,
+            speech_pad_ms: 0,
+            window_samples: 512,
+        };
+        let probs = vec![(0, 0.9), (512, 0.0), (1024, 0.0), (1536, 0.0), (2048, 0.0)];
+        let audio_len = 2560;
+        let segments = segments_from_probs(audio_len, &probs, &config);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_sample, 0);
+        assert_eq!(segments[0].end_sample, 512);
+    }
+
+    // Speech at the very last window of the audio (no silence follows).
+    #[test]
+    fn captures_speech_only_in_last_window() {
+        let config = VadConfig {
+            threshold: 0.5,
+            min_speech_ms: 10,
+            min_silence_ms: 100,
+            speech_pad_ms: 0,
+            window_samples: 512,
+        };
+        let audio_len = 512;
+        let probs = vec![(0, 0.9)];
+        let segments = segments_from_probs(audio_len, &probs, &config);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_sample, 0);
+        assert_eq!(segments[0].end_sample, 512);
+    }
+
+    // Two speech bursts with exactly min_silence of gap — they should remain separate.
+    #[test]
+    fn two_speech_bursts_separated_by_exact_min_silence() {
+        // min_silence_ms=100 @ 16 kHz = 1600 samples. window_samples=512.
+        // Gap from last_speech_end to start of next silence check must reach 1600.
+        // Speech at 0..512, then silence at 512,1024,1536 (gap=1536 < 1600), then 2048 (gap=2048-512=1536 still < 1600)
+        // Gap at 2560: 2560 - 512 = 2048 >= 1600 → segment closes.
+        // Then speech at 3072.
+        let config = VadConfig {
+            threshold: 0.5,
+            min_speech_ms: 10,
+            min_silence_ms: 100, // 1600 samples
+            speech_pad_ms: 0,
+            window_samples: 512,
+        };
+        let probs = vec![
+            (0, 0.9),
+            (512, 0.0),
+            (1024, 0.0),
+            (1536, 0.0),
+            (2048, 0.0),
+            (2560, 0.0), // gap from 512 to 2560 = 2048 >= 1600 → closes first segment
+            (3072, 0.9),
+            (3584, 0.0),
+            (4096, 0.0),
+            (4608, 0.0),
+            (5120, 0.0), // gap from 3584 to 5120 = 1536 >= 1600? No: 5120-3584=1536 < 1600
+            (5632, 0.0), // 5632-3584=2048 >= 1600 → closes second segment
+        ];
+        let audio_len = 6144;
+        let segments = segments_from_probs(audio_len, &probs, &config);
+        assert_eq!(segments.len(), 2, "expected two separate speech segments");
+        assert_eq!(segments[0].start_sample, 0);
+        assert_eq!(segments[0].end_sample, 512);
+        assert_eq!(segments[1].start_sample, 3072);
+        assert_eq!(segments[1].end_sample, 3584);
+    }
 }

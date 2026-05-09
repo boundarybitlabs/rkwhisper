@@ -505,9 +505,117 @@ fn argmax_token(logits: &[f32]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{fixed_audio_windows, timestamp_token_to_sec, vad_audio_windows};
+    use super::{AudioWindow, fixed_audio_windows, timestamp_token_to_sec, vad_audio_windows};
     use crate::N_SAMPLES;
     use crate::vad::VadSegment;
+
+    // Returns true iff every sample in every VAD segment is contained in some window.
+    // Advances through windows in sorted order to keep this O(segs * windows).
+    fn all_speech_covered(segs: &[VadSegment], windows: &[AudioWindow]) -> bool {
+        for seg in segs {
+            let mut pos = seg.start_sample;
+            'advance: while pos < seg.end_sample {
+                for w in windows {
+                    if w.start_sample <= pos && pos < w.end_sample {
+                        pos = w.end_sample;
+                        continue 'advance;
+                    }
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    fn seg(start: usize, end: usize) -> VadSegment {
+        VadSegment {
+            start_sample: start,
+            end_sample: end,
+            start_sec: 0.0,
+            end_sec: 0.0,
+        }
+    }
+
+    #[test]
+    fn coverage_single_short_segment() {
+        let segs = vec![seg(100, 200)];
+        let wins = vad_audio_windows(&segs);
+        assert!(
+            all_speech_covered(&segs, &wins),
+            "short segment not fully covered"
+        );
+    }
+
+    #[test]
+    fn coverage_single_segment_exactly_n_samples() {
+        let segs = vec![seg(0, N_SAMPLES)];
+        let wins = vad_audio_windows(&segs);
+        assert!(
+            all_speech_covered(&segs, &wins),
+            "exact-window segment not fully covered"
+        );
+    }
+
+    #[test]
+    fn coverage_single_long_segment() {
+        let segs = vec![seg(50, 50 + N_SAMPLES + 999)];
+        let wins = vad_audio_windows(&segs);
+        assert!(
+            all_speech_covered(&segs, &wins),
+            "long segment spanning two windows not fully covered"
+        );
+    }
+
+    #[test]
+    fn coverage_two_short_segments_fit_in_one_window() {
+        let segs = vec![seg(0, 1000), seg(5000, 6000)];
+        let wins = vad_audio_windows(&segs);
+        assert_eq!(wins.len(), 1);
+        assert!(all_speech_covered(&segs, &wins));
+    }
+
+    #[test]
+    fn coverage_two_segments_forced_into_separate_windows() {
+        // Second segment ends > N_SAMPLES after first segment's start.
+        let segs = vec![seg(0, 1000), seg(N_SAMPLES - 100, N_SAMPLES + 200)];
+        let wins = vad_audio_windows(&segs);
+        assert!(
+            all_speech_covered(&segs, &wins),
+            "segments split across window boundary not fully covered"
+        );
+    }
+
+    #[test]
+    fn coverage_segment_starting_far_into_audio() {
+        let segs = vec![seg(N_SAMPLES + 300, N_SAMPLES + 800)];
+        let wins = vad_audio_windows(&segs);
+        assert!(all_speech_covered(&segs, &wins));
+    }
+
+    #[test]
+    fn coverage_many_small_segments_spanning_multiple_windows() {
+        // 200 segments of 100 samples each, 1000 samples apart → spans ~200 000 samples total.
+        // Still fits in one 30-second window.
+        let segs: Vec<VadSegment> = (0..200).map(|i| seg(i * 1000, i * 1000 + 100)).collect();
+        let wins = vad_audio_windows(&segs);
+        assert!(all_speech_covered(&segs, &wins));
+    }
+
+    #[test]
+    fn coverage_segments_spanning_three_windows() {
+        // Three consecutive 35-second segments: forces 6 windows total.
+        let s = 16000usize * 35;
+        let segs = vec![
+            seg(0, s),
+            seg(s + 500, 2 * s + 500),
+            seg(2 * s + 1000, 3 * s + 1000),
+        ];
+        let wins = vad_audio_windows(&segs);
+        assert!(
+            all_speech_covered(&segs, &wins),
+            "three 35-second segments not fully covered"
+        );
+    }
 
     #[test]
     fn fixed_windows_cover_audio() {
