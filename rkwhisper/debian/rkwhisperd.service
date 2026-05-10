@@ -1,0 +1,35 @@
+[Unit]
+Description=RKWhisper ASR daemon
+Documentation=https://github.com/boundarybitlabs/rkwhisper
+After=local-fs.target
+
+[Service]
+Type=simple
+User=rkwhisper
+Group=rkwhisper
+SupplementaryGroups=render video
+
+# systemd owns /run/rkwhisper/ — creates it before start, removes it (and
+# asr.sock) after the service exits.
+RuntimeDirectory=rkwhisper
+RuntimeDirectoryMode=0750
+
+ExecStart=/usr/sbin/rkwhisperd
+Restart=on-failure
+RestartSec=5
+
+# Log through the journal; use `journalctl -u rkwhisperd` to follow.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rkwhisperd
+
+# Harden the service.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Allow read access to model files and config.
+ReadOnlyPaths=/usr/share/rkwhisper /etc/rkwhisper.toml
+
+[Install]
+WantedBy=multi-user.target

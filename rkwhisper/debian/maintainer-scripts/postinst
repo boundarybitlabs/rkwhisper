@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+# Create the rkwhisper system user/group if they don't exist.
+if ! getent group rkwhisper > /dev/null 2>&1; then
+    addgroup --system rkwhisper
+fi
+if ! getent passwd rkwhisper > /dev/null 2>&1; then
+    adduser --system --ingroup rkwhisper --no-create-home \
+        --home /nonexistent --shell /usr/sbin/nologin \
+        --gecos "RKWhisper ASR daemon" rkwhisper
+fi
+
+# Grant access to the RKNPU DRM render node (/dev/dri/renderD*, owned by root:render).
+for _grp in render video; do
+    if getent group "$_grp" > /dev/null 2>&1; then
+        adduser rkwhisper "$_grp" || true
+    fi
+done
+
+# Create the model directory; models must be installed separately.
+mkdir -p /usr/share/rkwhisper
+
+#DEBHELPER#

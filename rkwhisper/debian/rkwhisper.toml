@@ -1,0 +1,8 @@
+# rkwhisperd configuration
+# List the model IDs to load at startup.  Each ID corresponds to a
+# subdirectory under the model root (/usr/share/rkwhisper by default, or
+# $RKWHISPER_MODEL_ROOT if set).
+#
+# Example IDs: whisper-tiny-30s, whisper-base-30s, whisper-small-30s,
+#              whisper-medium-30s, whisper-large-v3-turbo-30s
+models = ["whisper-small-30s"]
