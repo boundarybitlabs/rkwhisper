@@ -1,44 +1,72 @@
 # rkwhisper
 
-`rkwhisper` is a Rust Whisper transcription pipeline for Rockchip RKNN/NPU
-models. It runs separate RKNN graphs for mel spectrogram generation, the Whisper
-encoder, encoder cross-attention K/V generation, and autoregressive decoder
-steps.
+`rkwhisper` lets applications talk to a local Whisper transcription daemon
+running on Rockchip NPU hardware.
 
-The crate provides:
+The main thing this repo gives you is client access:
 
-- `rkwhisper`: a CLI for mono 16 kHz WAV transcription.
-- `rkwhisper --multi-npu`: a three-worker RK3588 pipeline that uses the three
-  NPU cores concurrently.
-- `rkwhisperd`: a Unix socket daemon with persistent multi-NPU model pools.
+- A Rust client crate in [`rkwhisper-client`](rkwhisper-client)
+- A Python client package in [`rkwhisper-python`](rkwhisper-python)
+- A shared Unix socket protocol in [`rkwhisper-protocol`](rkwhisper-protocol)
+- A daemon, `rkwhisperd`, that keeps models warm and serves transcription jobs
+
+The daemon is the hardware-facing part. Your app sends 16 kHz mono PCM audio to
+the daemon over a Unix socket, then receives transcript segments as they are
+decoded.
+
+![rkwhisper-bench screenshot](rkwhisper-bench.png)
+
+## Who This Is For
+
+Use `rkwhisper` when you want local speech-to-text on Rockchip boards without
+embedding RKNN model management, shared-memory audio transport, and multi-NPU
+scheduling inside every application.
+
+The clients are designed for:
+
+- Batch transcription of short clips
+- Live or incremental transcription from an app
+- Async applications that need to send audio and receive segments concurrently
+- Benchmarking transcription speed and real-time factor on target hardware
+
+## Repository Layout
+
+```text
+rkwhisper-client/     Rust client crate
+rkwhisper-python/     Python client package backed by Rust/PyO3
+rkwhisper-protocol/   Shared protocol types and framing
+rkwhisper/            Daemon and lower-level transcription pipeline
+rkwhisper-bench/      Python benchmark CLI
+proto/                Protocol schema
+```
 
 ## Requirements
 
-- Rockchip hardware and runtime support compatible with `rknpu2`.
-- RKNN model files for the selected Whisper model size.
-- A Whisper `tokenizer.json`.
-- Rust with edition 2024 support.
-- CLI input audio as mono 16 kHz WAV.
+Runtime transcription requires:
 
-The full transcription path requires the RKNN runtime library and model files to
-be available on the target system.
+- Rockchip hardware and runtime support compatible with `rknpu2`
+- RKNN model files for the Whisper model you want to serve
+- A Whisper `tokenizer.json`
+- A VAD RKNN model
+- Audio input as 16 kHz mono signed 16-bit PCM
 
-## Build
+Development requires Rust with edition 2024 support. The Python package uses
+`maturin`.
 
-```sh
-cargo build --release
-cargo test
-```
+## Start The Daemon
 
-On non-Rockchip development machines, pure Rust tests may be useful, but full
-application runs require a compatible Rockchip RKNN runtime.
+The clients connect to `rkwhisperd`, so start there.
 
 ## Model Files
 
-The CLI accepts model paths explicitly. The daemon resolves enabled models from a
-model root, which defaults to `RKWHISPER_MODEL_ROOT` or `/usr/share/rkwhisper`.
+Model files live in a separate repository:
+[`boundarybitlabs/rkwhisper-models`](https://github.com/boundarybitlabs/rkwhisper-models).
 
-Daemon model directories use this layout:
+Download prebuilt model bundles from the
+[`rkwhisper-models` releases page](https://github.com/boundarybitlabs/rkwhisper-models/releases).
+
+Create model directories under `/usr/share/rkwhisper` or set
+`RKWHISPER_MODEL_ROOT` to another location:
 
 ```text
 /usr/share/rkwhisper/whisper-small-30s/
@@ -47,99 +75,15 @@ Daemon model directories use this layout:
   encoder.rknn
   enc_kv.rknn
   decoder.rknn
-  vad.rknn        # optional
+  vad.rknn
 ```
 
-Supported model ids are:
-
-- `whisper-tiny` or `whisper-tiny-30s`
-- `whisper-base` or `whisper-base-30s`
-- `whisper-small` or `whisper-small-30s`
-- `whisper-medium` or `whisper-medium-30s`
-- `whisper-large-v3-turbo` or `whisper-large-v3-turbo-30s`
-
-Each directory name must match the model id used by daemon requests and config.
-
-## CLI Usage
-
-Basic serial transcription:
-
-```sh
-cargo run --release --bin rkwhisper -- \
-  --model small \
-  --tokenizer /models/whisper-small-30s/tokenizer.json \
-  --mel-spec /models/whisper-small-30s/mel.rknn \
-  --encoder /models/whisper-small-30s/encoder.rknn \
-  --enc-kv /models/whisper-small-30s/enc_kv.rknn \
-  --decoder /models/whisper-small-30s/decoder.rknn \
-  input.wav
-```
-
-JSON output:
-
-```sh
-cargo run --release --bin rkwhisper -- \
-  --model small \
-  --output json \
-  --tokenizer /models/whisper-small-30s/tokenizer.json \
-  --mel-spec /models/whisper-small-30s/mel.rknn \
-  --encoder /models/whisper-small-30s/encoder.rknn \
-  --enc-kv /models/whisper-small-30s/enc_kv.rknn \
-  --decoder /models/whisper-small-30s/decoder.rknn \
-  input.wav
-```
-
-Use all three RK3588 NPU cores:
-
-```sh
-cargo run --release --bin rkwhisper -- \
-  --model small \
-  --multi-npu \
-  --tokenizer /models/whisper-small-30s/tokenizer.json \
-  --mel-spec /models/whisper-small-30s/mel.rknn \
-  --encoder /models/whisper-small-30s/encoder.rknn \
-  --enc-kv /models/whisper-small-30s/enc_kv.rknn \
-  --decoder /models/whisper-small-30s/decoder.rknn \
-  input.wav
-```
-
-Optional VAD:
-
-```sh
-cargo run --release --bin rkwhisper -- \
-  --model small \
-  --multi-npu \
-  --vad-model /models/whisper-small-30s/vad.rknn \
-  --vad-threshold 0.5 \
-  --vad-min-speech-ms 250 \
-  --vad-min-silence-ms 100 \
-  --vad-speech-pad-ms 200 \
-  --tokenizer /models/whisper-small-30s/tokenizer.json \
-  --mel-spec /models/whisper-small-30s/mel.rknn \
-  --encoder /models/whisper-small-30s/encoder.rknn \
-  --enc-kv /models/whisper-small-30s/enc_kv.rknn \
-  --decoder /models/whisper-small-30s/decoder.rknn \
-  input.wav
-```
-
-Useful decoding flags:
-
-- `--lang en`
-- `--task transcribe` or `--task translate`
-- `--max-new-tokens 128`
-- `--beam-size 1` for greedy decoding, or higher for beam search
-- `--notimestamps`
-- `--suppress-tokens default`, `none`, or a comma-separated token id list
-
-## Daemon Usage
-
-Create a config listing enabled model ids:
+Create a daemon config:
 
 ```toml
 # /etc/rkwhisper.toml
 models = [
   "whisper-small-30s",
-  "whisper-medium-30s",
 ]
 
 [concurrency]
@@ -148,7 +92,7 @@ client_window_queue_depth = 4
 client_response_queue_depth = 16
 ```
 
-Run the daemon with defaults:
+Run the daemon:
 
 ```sh
 cargo run --release --bin rkwhisperd
@@ -156,11 +100,11 @@ cargo run --release --bin rkwhisperd
 
 Defaults:
 
-- config: `/etc/rkwhisper.toml`
-- model root: `RKWHISPER_MODEL_ROOT` or `/usr/share/rkwhisper`
-- socket: `/run/rkwhisper/asr.sock`
+- Config: `/etc/rkwhisper.toml`
+- Model root: `RKWHISPER_MODEL_ROOT` or `/usr/share/rkwhisper`
+- Socket: `/run/rkwhisper/asr.sock`
 
-Override paths:
+Override paths when developing:
 
 ```sh
 cargo run --release --bin rkwhisperd -- \
@@ -169,100 +113,138 @@ cargo run --release --bin rkwhisperd -- \
   --socket /tmp/rkwhisper.sock
 ```
 
-`rkwhisperd` creates one scheduler thread and one persistent three-worker
-`ParallelTranscriberPool` per enabled model. Session threads accept clients
-concurrently, while each model scheduler processes transcription jobs serially.
-The concurrency limits are bounded and configurable; all queue depths must be at
-least 1.
+## Rust Client
 
-For packaged installs, run the service as the `rkwhisper` user and group and let
-systemd create `/run/rkwhisper` with `RuntimeDirectory`. `rkwhisperd` binds the
-socket and sets its mode to `0660`; it does not change socket ownership at
-startup.
+The Rust client exposes sync and async sessions. It handles the daemon handshake,
+shared audio ring setup, response decoding, cancellation, and backoff retries.
 
-A typical service setup uses:
+Add the local crate while developing in this workspace:
 
-```ini
-[Service]
-User=rkwhisper
-Group=rkwhisper
-RuntimeDirectory=rkwhisper
-RuntimeDirectoryMode=0750
-UMask=0007
-ExecStart=/usr/bin/rkwhisperd --socket /run/rkwhisper/asr.sock
+```toml
+[dependencies]
+rkwhisper-client = { path = "rkwhisper-client" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow = "1"
 ```
+
+Connect and stream audio asynchronously:
+
+```rust
+use rkwhisper_client::{ClientHello, Response, asynchronous::Session};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let hello = ClientHello {
+        model: "whisper-small-30s".to_string(),
+        client_id: "my-rust-app".to_string(),
+        ..ClientHello::default()
+    };
+
+    let session = Session::connect("/run/rkwhisper/asr.sock", hello).await?;
+    let (mut sender, mut receiver) = session.split();
+
+    let samples = vec![0.0f32; 16_000];
+    let pcm_bytes = rkwhisper_client::samples_to_pcm(&samples);
+
+    let send_task = tokio::spawn(async move {
+        sender.send_audio(&pcm_bytes).await?;
+        sender.finish().await?;
+        Ok::<_, rkwhisper_client::Error>(())
+    });
+
+    while let Ok(response) = receiver.recv_response().await {
+        match response {
+            Response::Segment { text, begin, end } => {
+                println!("{begin:.2}-{end:.2}: {text}");
+            }
+            Response::Done { audio_s, rtf } => {
+                println!("done: {audio_s:.2}s audio, {rtf:.3} RTF");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    send_task.await??;
+    Ok(())
+}
+```
+
+See [`rkwhisper-client/examples/async_client.rs`](rkwhisper-client/examples/async_client.rs)
+for a complete runnable example.
 
 ## Python Client
 
-A high-performance Python client is provided in the `rkwhisper-python` package. It
-supports both synchronous and asynchronous usage.
+The Python client provides sync and async sessions with the same shape as the
+Rust client. It is useful for applications, scripts, and benchmark tooling that
+need to stream audio without writing the protocol directly.
 
-### Installation
+Install for local development:
 
 ```sh
 cd rkwhisper-python
 maturin develop
 ```
 
-### Concurrent Streaming
-
-For real-time transcription, use the `split()` API to decouple audio transmission
-from response receiving. This prevents deadlocks and enables incremental output.
+Use the synchronous API:
 
 ```python
-from rkwhisper_client import SyncSession, ClientHello
+from rkwhisper_client import ClientHello, Done, Segment, SyncSession
 
-hello = ClientHello(model="whisper-small-30s", mode="stream")
+hello = ClientHello(
+    model="whisper-small-30s",
+    mode="stream",
+    client_id="my-python-app",
+)
+
 with SyncSession.connect("/run/rkwhisper/asr.sock", hello) as session:
     sender, receiver = session.split()
 
-    # Start a thread to consume incremental segments
-    def consume():
-        for resp in receiver:
-            if hasattr(resp, 'text'):
-                print(f"Segment: {resp.text}")
-
-    threading.Thread(target=consume, daemon=True).start()
-
-    # Send audio chunks in the main thread
-    sender.send_audio(pcm_data)
+    pcm_bytes = b"\x00\x00" * 16_000
+    sender.send_audio(pcm_bytes)
     sender.finish()
+
+    for response in receiver:
+        if isinstance(response, Segment):
+            print(f"{response.begin:.2f}-{response.end:.2f}: {response.text}")
+        elif isinstance(response, Done):
+            print(f"done: {response.audio_s:.2f}s audio, {response.rtf:.3f} RTF")
+            break
 ```
 
-The CLI tool `pywhisper-client.py` demonstrates this architecture.
+For live audio, send from one thread or task and receive from another. The
+`split()` API exists so audio transmission and response handling do not block
+each other.
 
-## Daemon Protocol
+The standalone [`pywhisper-client.py`](pywhisper-client.py) script demonstrates
+the same client flow from the command line.
 
-`rkwhisperd` uses a v1 Unix socket protocol with Protobuf control messages and
-shared-memory PCM transfer.
+## Benchmarking
 
-Connection flow:
+`rkwhisper-bench` measures transcription quality and speed against LibriSpeech
+audio. It uses the Python client to talk to a running `rkwhisperd` instance.
 
-1. Client sends a 4-byte little-endian length followed by a Protobuf
-   `ClientHello`.
-2. Server validates that the requested audio format is 16 kHz mono s16le.
-3. Server creates a 30-second audio ring buffer in a `memfd`.
-4. Server sends the `memfd` to the client with `SCM_RIGHTS`.
-5. Server sends a length-prefixed Protobuf `ServerHello`.
-6. Client writes s16le PCM bytes into the shared ring and sends one-byte socket
-   signals.
-7. Server replies with length-prefixed Protobuf `segment`, `done`,
-   `cancelled`, `back_off`, or `error` responses.
+```sh
+cd rkwhisper-bench
+python -m rkwhisper_bench.cli --help
+```
 
-Signal bytes:
+The screenshot above shows the benchmark output style: word error rate, audio
+duration, wall time, and real-time factor across a run.
 
-- `0x01`: data ready
-- `0x02`: end of stream
-- `0x03`: cancel
+## Supported Models
 
-Live streams fail fast with `back_off` when their next audio window cannot be
-accepted immediately. Ring buffer overruns are reported as protocol errors
-instead of silently dropping audio. Client cancellation returns `cancelled` with
-partial timing and window stats.
+The daemon expects model directory names to match the requested model id.
 
-The checked-in schema is [proto/rkwhisper.proto](proto/rkwhisper.proto).
+Supported ids:
 
-`ClientHello` defaults:
+- `whisper-tiny` or `whisper-tiny-30s`
+- `whisper-base` or `whisper-base-30s`
+- `whisper-small` or `whisper-small-30s`
+
+## Client Options
+
+Clients send a `ClientHello` when opening a session. Defaults are:
 
 - `mode`: `batch`
 - `lang`: `en`
@@ -271,8 +253,9 @@ The checked-in schema is [proto/rkwhisper.proto](proto/rkwhisper.proto).
 - `beam_size`: `5`
 - `notimestamps`: `false`
 - `suppress_tokens`: `default`
+- audio format: 16 kHz, mono, signed 16-bit PCM
 
-`ClientHello` may also include VAD overrides:
+VAD can be configured per session:
 
 - `vad_threshold`
 - `vad_min_speech_ms`
@@ -280,18 +263,41 @@ The checked-in schema is [proto/rkwhisper.proto](proto/rkwhisper.proto).
 - `vad_speech_pad_ms`
 - `vad_window_samples`
 
+## Protocol Reference
+
+`rkwhisperd` uses a v1 Unix socket protocol with Protobuf control messages and
+shared-memory PCM transfer. Client libraries handle this for normal use.
+
+Connection flow:
+
+1. The client sends a length-prefixed `ClientHello`.
+2. The server validates that the requested audio format is 16 kHz mono s16le.
+3. The server creates a 30-second audio ring buffer in a `memfd`.
+4. The server sends the `memfd` to the client with `SCM_RIGHTS`.
+5. The server sends a length-prefixed `ServerHello`.
+6. The client writes s16le PCM bytes into the shared ring and sends socket
+   signals.
+7. The server replies with `segment`, `done`, `cancelled`, `back_off`, or
+   `error` responses.
+
+Signal bytes:
+
+- `0x01`: data ready
+- `0x02`: end of stream
+- `0x03`: cancel
+
+The checked-in schema is [`proto/rkwhisper.proto`](proto/rkwhisper.proto).
+
 ## How It Works
 
 Audio is split into fixed 30-second windows or VAD-derived speech windows. Each
 window is converted to log-mel features, encoded, converted into encoder
-cross-attention K/V tensors, and decoded token by token with greedy decoding or
-beam search.
+cross-attention K/V tensors, and decoded token by token.
 
 In multi-NPU mode, each worker owns a full RKNN context set pinned to one RK3588
 NPU core. Tokio coordinates ready workers, dispatches pending windows, and
 reorders completed results by window index.
 
-For more detail:
+## License
 
-- [Code summary](notes/SUMMARY.md)
-- [Multi-NPU architecture](notes/MULTI_THREADED_PIPELINE.md)
+Apache-2.0. See [`LICENSE`](LICENSE).
