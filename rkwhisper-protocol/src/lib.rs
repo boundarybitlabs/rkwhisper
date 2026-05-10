@@ -3,7 +3,9 @@ use std::io::{IoSlice, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::ptr::null_mut;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, thiserror::Error)]
