@@ -238,9 +238,9 @@ The daemon expects model directory names to match the requested model id.
 
 Supported ids:
 
-- `whisper-tiny` or `whisper-tiny-30s`
-- `whisper-base` or `whisper-base-30s`
-- `whisper-small` or `whisper-small-30s`
+- `whisper-tiny-30s`
+- `whisper-base-30s`
+- `whisper-small-30s`
 
 ## Client Options
 
