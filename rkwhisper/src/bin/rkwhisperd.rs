@@ -8,7 +8,10 @@ use rkwhisper::{
         resolve_enabled_model_files,
     },
     daemon_stream::{LiveChunk, ReadOutcome, read_live_chunks},
-    parallel::{LiveTranscriptionStats, ParallelModelPaths, ParallelTranscriberPool, WhisperJob},
+    parallel::{
+        LiveTranscriptionStats, NPU_WORKERS, ParallelModelPaths, ParallelTranscriberPool, Ready,
+        WhisperJob, WorkerTranscription,
+    },
     protocol::{
         RING_DATA_BYTES, Response, SIGNAL_CANCEL, SIGNAL_DATA_READY, SIGNAL_END_OF_STREAM,
         ServerHello, SharedAudioRing, read_client_hello, validate_client_hello, write_response,
@@ -30,7 +33,7 @@ use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Instant;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tracing::{debug, trace};
 
 #[derive(Parser, Debug)]
@@ -434,7 +437,13 @@ impl ModelSchedulers {
             let (pool, vad) = ModelPool::load(lib, files)
                 .with_context(|| format!("failed to load model pool {model_id}"))?;
             let (job_tx, job_rx) = mpsc::channel::<ModelJob>(config.concurrency.model_queue_depth);
-            spawn_model_scheduler(model_id.clone(), pool, vad, job_rx)?;
+            spawn_model_scheduler(
+                model_id.clone(),
+                pool,
+                vad,
+                config.concurrency.clone(),
+                job_rx,
+            )?;
             schedulers.insert(model_id.clone(), job_tx);
         }
         Ok(Self {
@@ -506,262 +515,465 @@ enum SubmitError {
     SchedulerStopped(String),
 }
 
+struct ActiveLiveJob {
+    job_id: usize,
+    chunk_rx: mpsc::Receiver<Result<LiveChunk>>,
+    response_tx: std_mpsc::SyncSender<JobResponse>,
+    audio_buffer: Vec<f32>,
+    absolute_offset_samples: usize,
+    streaming_vad: Option<rkwhisper::vad::StreamingVad>,
+    probs: Vec<(usize, f32)>,
+    stats: LiveTranscriptionStats,
+    in_flight: usize,
+    next_window_index: usize,
+    producer_closed: bool,
+    pending_results: BTreeMap<usize, WindowTranscription>,
+    next_result_index: usize,
+    speech_active: bool,
+    tokenizer: Arc<Tokenizer>,
+    options: Arc<TranscribeOptions>,
+}
+
+impl ActiveLiveJob {
+    fn new(
+        job_id: usize,
+        header: RequestHeader,
+        chunk_rx: mpsc::Receiver<Result<LiveChunk>>,
+        response_tx: std_mpsc::SyncSender<JobResponse>,
+        tokenizer: Arc<Tokenizer>,
+        vad_enabled: bool,
+    ) -> Self {
+        let streaming_vad = vad_enabled.then(|| {
+            let defaults = rkwhisper::vad::VadConfig::default();
+            rkwhisper::vad::StreamingVad::new(rkwhisper::vad::VadConfig {
+                threshold: header.vad_threshold.unwrap_or(defaults.threshold),
+                min_speech_ms: header.vad_min_speech_ms.unwrap_or(defaults.min_speech_ms),
+                min_silence_ms: header.vad_min_silence_ms.unwrap_or(defaults.min_silence_ms),
+                speech_pad_ms: header.vad_speech_pad_ms.unwrap_or(defaults.speech_pad_ms),
+                window_samples: header.vad_window_samples.unwrap_or(defaults.window_samples),
+            })
+        });
+        let options = Arc::new(TranscribeOptions::new(
+            header.lang,
+            header.task,
+            header.notimestamps,
+            header.max_new_tokens,
+            header.beam_size,
+            SuppressTokens::parse(&header.suppress_tokens).unwrap_or(SuppressTokens::Default),
+        ));
+
+        Self {
+            job_id,
+            chunk_rx,
+            response_tx,
+            audio_buffer: Vec::new(),
+            absolute_offset_samples: 0,
+            streaming_vad,
+            probs: Vec::new(),
+            stats: LiveTranscriptionStats::default(),
+            in_flight: 0,
+            next_window_index: 0,
+            producer_closed: false,
+            pending_results: BTreeMap::new(),
+            next_result_index: 0,
+            speech_active: false,
+            tokenizer,
+            options,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.producer_closed && self.audio_buffer.is_empty() && self.in_flight == 0
+    }
+
+    fn finish_if_complete(&mut self) -> bool {
+        if !self.is_complete() {
+            return false;
+        }
+        if self.speech_active {
+            self.speech_active = false;
+            let end = rkwhisper::vad::samples_to_sec(self.absolute_offset_samples);
+            let _ = self.response_tx.send(JobResponse::SpeechEnded { end });
+        }
+        let _ = self.response_tx.send(JobResponse::Finished(Ok(self.stats)));
+        true
+    }
+
+    fn accept_chunk(&mut self, chunk: Option<Result<LiveChunk>>, vad_model: Option<&VadModel>) {
+        match chunk {
+            Some(Ok(chunk)) => {
+                let start_idx = self.audio_buffer.len();
+                self.audio_buffer.extend_from_slice(&chunk.samples);
+
+                if let (Some(vad), Some(v_model)) = (&mut self.streaming_vad, vad_model) {
+                    let win = vad.config().window_samples;
+                    let mut offset = 0;
+                    while offset < chunk.samples.len() {
+                        let end = (offset + win).min(chunk.samples.len());
+                        let prob = match vad.process_window(v_model, &chunk.samples[offset..end]) {
+                            Ok(prob) => prob,
+                            Err(error) => {
+                                let _ = self.response_tx.send(JobResponse::Finished(Err(error)));
+                                self.producer_closed = true;
+                                return;
+                            }
+                        };
+                        self.probs.push((start_idx + offset, prob));
+                        offset += win;
+                    }
+                }
+            }
+            Some(Err(error)) => {
+                let _ = self.response_tx.send(JobResponse::Finished(Err(error)));
+                self.producer_closed = true;
+            }
+            None => {
+                self.producer_closed = true;
+            }
+        }
+    }
+
+    fn refresh_speech_state(&mut self) {
+        if self.audio_buffer.is_empty() {
+            return;
+        }
+
+        if let Some(vad) = &self.streaming_vad {
+            let segments = rkwhisper::vad::segments_from_probs(
+                self.audio_buffer.len(),
+                &self.probs,
+                vad.config(),
+            );
+
+            if !segments.is_empty() && !self.speech_active {
+                self.speech_active = true;
+                let begin = rkwhisper::vad::samples_to_sec(
+                    self.absolute_offset_samples + segments[0].start_sample,
+                );
+                let _ = self.response_tx.send(JobResponse::SpeechStarted { begin });
+            } else if segments.is_empty() && self.speech_active {
+                self.speech_active = false;
+                let end = rkwhisper::vad::samples_to_sec(self.absolute_offset_samples);
+                let _ = self.response_tx.send(JobResponse::SpeechEnded { end });
+            }
+
+            if segments.is_empty() && self.producer_closed {
+                self.absolute_offset_samples += self.audio_buffer.len();
+                self.audio_buffer.clear();
+                self.probs.clear();
+            }
+        }
+    }
+
+    fn next_dispatch_span(&self) -> Option<(usize, usize)> {
+        if let Some(vad) = &self.streaming_vad {
+            let segments = rkwhisper::vad::segments_from_probs(
+                self.audio_buffer.len(),
+                &self.probs,
+                vad.config(),
+            );
+            let first_seg = segments.first()?;
+            let mut last_fitting_idx = 0;
+            for (i, seg) in segments.iter().enumerate() {
+                if seg.end_sample - first_seg.start_sample <= 480000 {
+                    last_fitting_idx = i;
+                } else {
+                    break;
+                }
+            }
+
+            let last_fitting_seg = &segments[last_fitting_idx];
+            let silence_timeout_samples = 32000;
+            let is_timeout =
+                self.audio_buffer.len() - last_fitting_seg.end_sample >= silence_timeout_samples;
+            let has_overflowing_segment = last_fitting_idx + 1 < segments.len();
+            let is_full_window = last_fitting_seg.end_sample - first_seg.start_sample >= 480000;
+
+            if has_overflowing_segment
+                || is_full_window
+                || is_timeout
+                || (self.producer_closed && !self.audio_buffer.is_empty())
+            {
+                let dispatch_end = if is_full_window {
+                    first_seg.start_sample + 480000
+                } else {
+                    last_fitting_seg.end_sample
+                };
+                return Some((first_seg.start_sample, dispatch_end));
+            }
+        } else if self.audio_buffer.len() >= 480000
+            || (self.producer_closed && !self.audio_buffer.is_empty())
+        {
+            return Some((0, 480000.min(self.audio_buffer.len())));
+        }
+
+        None
+    }
+
+    async fn dispatch_to_worker(
+        &mut self,
+        worker_id: usize,
+        worker_txs: &[mpsc::Sender<WhisperJob>],
+    ) {
+        let Some((start, end)) = self.next_dispatch_span() else {
+            return;
+        };
+        let samples = self.audio_buffer.drain(..end).collect::<Vec<_>>();
+        let segment_samples = samples[start..].to_vec();
+        let window_start_sec = rkwhisper::vad::samples_to_sec(self.absolute_offset_samples + start);
+        self.absolute_offset_samples += end;
+        self.probs = self
+            .probs
+            .drain(..)
+            .filter(|(idx, _)| *idx >= end)
+            .map(|(idx, prob)| (idx - end, prob))
+            .collect();
+
+        let job = WhisperJob {
+            job_id: self.job_id,
+            window_index: self.next_window_index,
+            absolute_start_sec: window_start_sec,
+            start_sample: 0,
+            end_sample: segment_samples.len(),
+            samples: Arc::from(segment_samples),
+            tokenizer: self.tokenizer.clone(),
+            options: self.options.clone(),
+        };
+
+        if worker_txs[worker_id].send(job).await.is_ok() {
+            self.in_flight += 1;
+            self.stats.windows_dispatched += 1;
+            self.next_window_index += 1;
+        }
+    }
+
+    fn handle_result(&mut self, result: WindowTranscription) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.stats.windows_completed += 1;
+        self.pending_results.insert(result.window_index, result);
+
+        while let Some(result) = self.pending_results.remove(&self.next_result_index) {
+            for segment in result.segments {
+                let _ = self.response_tx.send(JobResponse::Segment {
+                    text: segment.text.clone(),
+                    begin: segment.start_sec,
+                    end: segment.end_sec,
+                });
+            }
+            self.next_result_index += 1;
+        }
+    }
+}
+
+async fn run_live_jobs(
+    initial_job: ActiveLiveJob,
+    next_job_id: &mut usize,
+    job_rx: &mut mpsc::Receiver<ModelJob>,
+    vad_model: Option<&VadModel>,
+    ready_rx: &mut mpsc::Receiver<Ready>,
+    result_rx: &mut mpsc::Receiver<Result<WorkerTranscription>>,
+    worker_txs: Vec<mpsc::Sender<WhisperJob>>,
+    concurrency: &ConcurrencyConfig,
+) -> VecDeque<ModelJob> {
+    let max_active_jobs = concurrency.max_active_jobs_per_model;
+    let max_in_flight_windows_per_job = concurrency.max_in_flight_windows_per_job.min(NPU_WORKERS);
+    let mut active_jobs = Vec::<ActiveLiveJob>::from([initial_job]);
+    let mut deferred_jobs = VecDeque::new();
+    let mut ready_workers = VecDeque::new();
+    let mut dispatch_cursor = 0usize;
+
+    while !active_jobs.is_empty() {
+        drain_live_chunks(&mut active_jobs, vad_model, max_in_flight_windows_per_job);
+        remove_completed_jobs(&mut active_jobs);
+        if active_jobs.is_empty() {
+            break;
+        }
+
+        tokio::select! {
+            job = job_rx.recv(), if deferred_jobs.is_empty() && active_jobs.len() < max_active_jobs => {
+                match job {
+                    Some(ModelJob::Live { header, chunk_rx, response_tx }) => {
+                        let tokenizer = active_jobs[0].tokenizer.clone();
+                        let active_job = ActiveLiveJob::new(
+                            *next_job_id,
+                            header,
+                            chunk_rx,
+                            response_tx,
+                            tokenizer,
+                            vad_model.is_some(),
+                        );
+                        *next_job_id += 1;
+                        active_jobs.push(active_job);
+                    }
+                    Some(job @ ModelJob::Batch { .. }) => {
+                        deferred_jobs.push_back(job);
+                    }
+                    None => {}
+                }
+            }
+
+            ready = ready_rx.recv() => {
+                if let Some(ready) = ready {
+                    ready_workers.push_back(ready.worker_id);
+                }
+            }
+
+            result = result_rx.recv(), if active_jobs.iter().any(|job| job.in_flight > 0) => {
+                match result {
+                    Some(Ok(result)) => {
+                        if let Some(job) = active_jobs.iter_mut().find(|job| job.job_id == result.job_id) {
+                            job.handle_result(result.transcription);
+                        }
+                    }
+                    Some(Err(error)) => {
+                        for job in &active_jobs {
+                            let _ = job.response_tx.send(JobResponse::Finished(Err(anyhow::anyhow!("{error:#}"))));
+                        }
+                        active_jobs.clear();
+                        break;
+                    }
+                    None => {}
+                }
+            }
+
+            _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+        }
+
+        drain_live_chunks(&mut active_jobs, vad_model, max_in_flight_windows_per_job);
+        for job in &mut active_jobs {
+            job.refresh_speech_state();
+        }
+        dispatch_ready_live_windows(
+            &mut active_jobs,
+            &mut ready_workers,
+            &worker_txs,
+            max_in_flight_windows_per_job,
+            &mut dispatch_cursor,
+        )
+        .await;
+        remove_completed_jobs(&mut active_jobs);
+    }
+
+    deferred_jobs
+}
+
+fn drain_live_chunks(
+    active_jobs: &mut [ActiveLiveJob],
+    vad_model: Option<&VadModel>,
+    max_in_flight_windows_per_job: usize,
+) {
+    for job in active_jobs {
+        if job.producer_closed || job.in_flight >= max_in_flight_windows_per_job {
+            continue;
+        }
+
+        loop {
+            match job.chunk_rx.try_recv() {
+                Ok(chunk) => job.accept_chunk(Some(chunk), vad_model),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    job.accept_chunk(None, vad_model);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn dispatch_ready_live_windows(
+    active_jobs: &mut [ActiveLiveJob],
+    ready_workers: &mut VecDeque<usize>,
+    worker_txs: &[mpsc::Sender<WhisperJob>],
+    max_in_flight_windows_per_job: usize,
+    dispatch_cursor: &mut usize,
+) {
+    while !ready_workers.is_empty() && !active_jobs.is_empty() {
+        let mut selected = None;
+        for _ in 0..active_jobs.len() {
+            let idx = *dispatch_cursor % active_jobs.len();
+            *dispatch_cursor = (*dispatch_cursor + 1) % active_jobs.len();
+            let job = &active_jobs[idx];
+            if job.in_flight < max_in_flight_windows_per_job && job.next_dispatch_span().is_some() {
+                selected = Some(idx);
+                break;
+            }
+        }
+
+        let Some(job_idx) = selected else {
+            break;
+        };
+        let worker_id = ready_workers.pop_front().unwrap();
+        active_jobs[job_idx]
+            .dispatch_to_worker(worker_id, worker_txs)
+            .await;
+    }
+}
+
+fn remove_completed_jobs(active_jobs: &mut Vec<ActiveLiveJob>) {
+    let mut idx = 0;
+    while idx < active_jobs.len() {
+        if active_jobs[idx].finish_if_complete() {
+            active_jobs.remove(idx);
+        } else {
+            idx += 1;
+        }
+    }
+}
+
 fn spawn_model_scheduler(
     model_id: String,
     mut pool: ModelPool,
     vad_model: Option<VadModel>,
+    concurrency: ConcurrencyConfig,
     mut job_rx: mpsc::Receiver<ModelJob>,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name(format!("rkwhisper-scheduler-{model_id}"))
         .spawn(move || {
-            while let Some(job) = job_rx.blocking_recv() {
+            let mut deferred_jobs = VecDeque::new();
+            let mut next_job_id = 1usize;
+
+            loop {
+                let job = if let Some(job) = deferred_jobs.pop_front() {
+                    job
+                } else {
+                    match job_rx.blocking_recv() {
+                        Some(job) => job,
+                        None => break,
+                    }
+                };
                 match job {
                     ModelJob::Live {
                         header,
-                        mut chunk_rx,
+                        chunk_rx,
                         response_tx,
                     } => {
-                        let mut audio_buffer = Vec::new();
-                        let mut absolute_offset_samples = 0usize;
-                        let mut streaming_vad = vad_model.as_ref().map(|_m| {
-                            let defaults = rkwhisper::vad::VadConfig::default();
-                            rkwhisper::vad::StreamingVad::new(rkwhisper::vad::VadConfig {
-                                threshold: header.vad_threshold.unwrap_or(defaults.threshold),
-                                min_speech_ms: header.vad_min_speech_ms.unwrap_or(defaults.min_speech_ms),
-                                min_silence_ms: header.vad_min_silence_ms.unwrap_or(defaults.min_silence_ms),
-                                speech_pad_ms: header.vad_speech_pad_ms.unwrap_or(defaults.speech_pad_ms),
-                                window_samples: header.vad_window_samples.unwrap_or(defaults.window_samples),
-                            })
-                        });
-
-                        let mut probs = Vec::new();
-                        let mut total_stats = LiveTranscriptionStats::default();
-                        let mut in_flight = 0usize;
-                        let mut next_window_index = 0usize;
-                        let mut producer_closed = false;
-                        let mut pending_results = BTreeMap::<usize, WindowTranscription>::new();
-                        let mut next_result_index = 0usize;
-                        let mut ready_workers = VecDeque::new();
-                        let mut speech_active = false;
-
-                        let (pool_ready_rx, pool_result_rx, worker_txs, tokenizer) = match &mut pool {
-                            ModelPool::Tiny(p) => {
-                                let txs = p.pool.worker_txs();
-                                (&mut p.pool.ready_rx, &mut p.pool.result_rx, txs, p.tokenizer.clone())
-                            }
-                            ModelPool::Base(p) => {
-                                let txs = p.pool.worker_txs();
-                                (&mut p.pool.ready_rx, &mut p.pool.result_rx, txs, p.tokenizer.clone())
-                            }
-                            ModelPool::Small(p) => {
-                                let txs = p.pool.worker_txs();
-                                (&mut p.pool.ready_rx, &mut p.pool.result_rx, txs, p.tokenizer.clone())
-                            }
-                            ModelPool::Medium(p) => {
-                                let txs = p.pool.worker_txs();
-                                (&mut p.pool.ready_rx, &mut p.pool.result_rx, txs, p.tokenizer.clone())
-                            }
-                            ModelPool::LargeV3Turbo(p) => {
-                                let txs = p.pool.worker_txs();
-                                (&mut p.pool.ready_rx, &mut p.pool.result_rx, txs, p.tokenizer.clone())
-                            }
-                        };
-
-                        let options = Arc::new(TranscribeOptions::new(
-                            header.lang.clone(),
-                            header.task.clone(),
-                            header.notimestamps,
-                            header.max_new_tokens,
-                            header.beam_size,
-                            SuppressTokens::parse(&header.suppress_tokens).unwrap_or(SuppressTokens::Default),
+                        let (pool_ready_rx, pool_result_rx, worker_txs, tokenizer) =
+                            pool.worker_parts();
+                        let active_job = ActiveLiveJob::new(
+                            next_job_id,
+                            header,
+                            chunk_rx,
+                            response_tx,
+                            tokenizer,
+                            vad_model.is_some(),
+                        );
+                        next_job_id += 1;
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        let newly_deferred = rt.block_on(run_live_jobs(
+                            active_job,
+                            &mut next_job_id,
+                            &mut job_rx,
+                            vad_model.as_ref(),
+                            pool_ready_rx,
+                            pool_result_rx,
+                            worker_txs,
+                            &concurrency,
                         ));
-
-                        // Local runtime for the scheduler loop
-                        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-
-                        rt.block_on(async {
-                            loop {
-                                if producer_closed && audio_buffer.is_empty() && in_flight == 0 {
-                                    if speech_active {
-                                        speech_active = false;
-                                        let end = rkwhisper::vad::samples_to_sec(absolute_offset_samples);
-                                        let _ = response_tx.send(JobResponse::SpeechEnded { end });
-                                    }
-                                    break;
-                                }
-
-                                tokio::select! {
-                                    // 1. Accept new audio chunks only if we have fewer than 3 windows in flight
-                                    chunk = chunk_rx.recv(), if !producer_closed && in_flight < 3 => {
-                                        match chunk {
-                                            Some(Ok(c)) => {
-                                                let start_idx = audio_buffer.len();
-                                                audio_buffer.extend_from_slice(&c.samples);
-
-                                                if let (Some(vad), Some(v_model)) = (&mut streaming_vad, &vad_model) {
-                                                    let win = vad.config().window_samples;
-                                                    let mut offset = 0;
-                                                    while offset < c.samples.len() {
-                                                        let end = (offset + win).min(c.samples.len());
-                                                        let prob = match vad.process_window(v_model, &c.samples[offset..end]) {
-                                                            Ok(p) => p,
-                                                            Err(e) => {
-                                                                let _ = response_tx.send(JobResponse::Finished(Err(e)));
-                                                                return;
-                                                            }
-                                                        };
-                                                        probs.push((start_idx + offset, prob));
-                                                        offset += win;
-                                                    }
-                                                }
-                                            }
-                                            Some(Err(e)) => {
-                                                let _ = response_tx.send(JobResponse::Finished(Err(e)));
-                                                return;
-                                            }
-                                            None => {
-                                                producer_closed = true;
-                                            }
-                                        }
-                                    }
-
-                                    // 2. Accept ready signals from NPU workers
-                                    ready = pool_ready_rx.recv() => {
-                                        if let Some(r) = ready {
-                                            ready_workers.push_back(r.worker_id);
-                                        }
-                                    }
-
-                                    // 3. Accept transcription results from NPU workers
-                                    result = pool_result_rx.recv(), if in_flight > 0 => {
-                                        match result {
-                                            Some(Ok(res)) => {
-                                                in_flight -= 1;
-                                                total_stats.windows_completed += 1;
-                                                pending_results.insert(res.window_index, res);
-
-                                                while let Some(res) = pending_results.remove(&next_result_index) {
-                                                    for segment in res.segments {
-                                                        let _ = response_tx.send(JobResponse::Segment {
-                                                            text: segment.text.clone(),
-                                                            begin: segment.start_sec,
-                                                            end: segment.end_sec,
-                                                        });
-                                                    }
-                                                    next_result_index += 1;
-                                                }
-                                            }
-                                            Some(Err(e)) => {
-                                                let _ = response_tx.send(JobResponse::Finished(Err(e)));
-                                                return;
-                                            }
-                                            None => {}
-                                        }
-                                    }
-                                }
-
-                                // 4. Check if we can dispatch a new window
-                                if !audio_buffer.is_empty() {
-                                    if let (Some(vad), Some(_v_model)) = (&mut streaming_vad, &vad_model) {
-                                        let segments = rkwhisper::vad::segments_from_probs(
-                                            audio_buffer.len(),
-                                            &probs,
-                                            vad.config(),
-                                        );
-
-                                        if !segments.is_empty() && !speech_active {
-                                            speech_active = true;
-                                            let begin = rkwhisper::vad::samples_to_sec(absolute_offset_samples + segments[0].start_sample);
-                                            let _ = response_tx.send(JobResponse::SpeechStarted { begin });
-                                        } else if segments.is_empty() && speech_active {
-                                            speech_active = false;
-                                            let end = rkwhisper::vad::samples_to_sec(absolute_offset_samples);
-                                            let _ = response_tx.send(JobResponse::SpeechEnded { end });
-                                        }
-
-                                        if segments.is_empty() && producer_closed {
-                                            // Stream closed and VAD found no more speech in buffer.
-                                            // Drain the rest to allow exit.
-                                            absolute_offset_samples += audio_buffer.len();
-                                            audio_buffer.clear();
-                                            probs.clear();
-                                        }
-                                    }
-                                }
-
-                                while !ready_workers.is_empty() {
-                                    let mut segment_to_dispatch = None;
-
-                                    if let (Some(vad), Some(_v_model)) = (&mut streaming_vad, &vad_model) {
-                                        let segments = rkwhisper::vad::segments_from_probs(
-                                            audio_buffer.len(),
-                                            &probs,
-                                            vad.config(),
-                                        );
-
-                                        if let Some(first_seg) = segments.first() {
-                                            // Find the last segment that fits within 30s of the first segment's start
-                                            let mut last_fitting_idx = 0;
-                                            for (i, seg) in segments.iter().enumerate() {
-                                                if seg.end_sample - first_seg.start_sample <= 480000 {
-                                                    last_fitting_idx = i;
-                                                } else {
-                                                    break;
-                                                }
-                                            }
-
-                                            let last_fitting_seg = &segments[last_fitting_idx];
-                                            let silence_timeout_samples = 32000; // 2 seconds
-                                            let is_timeout = audio_buffer.len() - last_fitting_seg.end_sample >= silence_timeout_samples;
-                                            let has_overflowing_segment = last_fitting_idx + 1 < segments.len();
-                                            let is_full_window = last_fitting_seg.end_sample - first_seg.start_sample >= 480000;
-
-                                            if has_overflowing_segment || is_full_window || is_timeout || (producer_closed && !audio_buffer.is_empty()) {
-                                                // Dispatch accumulated span
-                                                let dispatch_end = if is_full_window { first_seg.start_sample + 480000 } else { last_fitting_seg.end_sample };
-                                                segment_to_dispatch = Some((first_seg.start_sample, dispatch_end));
-                                            }
-                                        }
-                                    } else {
-                                        // No VAD, fixed 30s windows
-                                        if audio_buffer.len() >= 480000 || (producer_closed && !audio_buffer.is_empty()) {
-                                            let dispatch_end = 480000.min(audio_buffer.len());
-                                            segment_to_dispatch = Some((0, dispatch_end));
-                                        }
-                                    }
-
-                                    if let Some((start, end)) = segment_to_dispatch {
-                                        let worker_id = ready_workers.pop_front().unwrap();
-                                        let samples = audio_buffer.drain(..end).collect::<Vec<_>>();
-                                        let segment_samples = samples[start..].to_vec();
-
-                                        let window_start_sec = rkwhisper::vad::samples_to_sec(absolute_offset_samples + start);
-                                        absolute_offset_samples += end;
-                                        probs = probs.into_iter().filter(|(idx, _)| *idx >= end).map(|(idx, p)| (idx - end, p)).collect();
-
-                                        let job = WhisperJob {
-                                            window_index: next_window_index,
-                                            absolute_start_sec: window_start_sec,
-                                            start_sample: 0,
-                                            end_sample: segment_samples.len(),
-                                            samples: Arc::from(segment_samples),
-                                            tokenizer: tokenizer.clone(),
-                                            options: options.clone(),
-                                        };
-
-                                        let _ = worker_txs[worker_id].send(job).await;
-                                        in_flight += 1;
-                                        total_stats.windows_dispatched += 1;
-                                        next_window_index += 1;
-                                    } else {
-                                        break;
-                                    }
-                                }
-
-                            }
-                            let _ = response_tx.send(JobResponse::Finished(Ok(total_stats)));
-                        });
+                        deferred_jobs.extend(newly_deferred);
                     }
                     ModelJob::Batch {
                         header,
@@ -783,15 +995,30 @@ fn spawn_model_scheduler(
                             let defaults = rkwhisper::vad::VadConfig::default();
                             let vad_config = rkwhisper::vad::VadConfig {
                                 threshold: header.vad_threshold.unwrap_or(defaults.threshold),
-                                min_speech_ms: header.vad_min_speech_ms.unwrap_or(defaults.min_speech_ms),
-                                min_silence_ms: header.vad_min_silence_ms.unwrap_or(defaults.min_silence_ms),
-                                speech_pad_ms: header.vad_speech_pad_ms.unwrap_or(defaults.speech_pad_ms),
-                                window_samples: header.vad_window_samples.unwrap_or(defaults.window_samples),
+                                min_speech_ms: header
+                                    .vad_min_speech_ms
+                                    .unwrap_or(defaults.min_speech_ms),
+                                min_silence_ms: header
+                                    .vad_min_silence_ms
+                                    .unwrap_or(defaults.min_silence_ms),
+                                speech_pad_ms: header
+                                    .vad_speech_pad_ms
+                                    .unwrap_or(defaults.speech_pad_ms),
+                                window_samples: header
+                                    .vad_window_samples
+                                    .unwrap_or(defaults.window_samples),
                             };
-                            let segs = v_model.segments_with_config(&audio, &vad_config).unwrap_or_default();
+                            let segs = v_model
+                                .segments_with_config(&audio, &vad_config)
+                                .unwrap_or_default();
                             debug!(vad_segments = segs.len(), "VAD segmentation complete");
                             for (i, seg) in segs.iter().enumerate() {
-                                trace!(i, start_sec = seg.start_sec, end_sec = seg.end_sec, "VAD segment");
+                                trace!(
+                                    i,
+                                    start_sec = seg.start_sec,
+                                    end_sec = seg.end_sec,
+                                    "VAD segment"
+                                );
                             }
                             segs
                         } else {
@@ -882,6 +1109,63 @@ enum ModelPool {
 }
 
 impl ModelPool {
+    fn worker_parts(
+        &mut self,
+    ) -> (
+        &mut mpsc::Receiver<Ready>,
+        &mut mpsc::Receiver<Result<WorkerTranscription>>,
+        Vec<mpsc::Sender<WhisperJob>>,
+        Arc<Tokenizer>,
+    ) {
+        match self {
+            Self::Tiny(p) => {
+                let txs = p.pool.worker_txs();
+                (
+                    &mut p.pool.ready_rx,
+                    &mut p.pool.result_rx,
+                    txs,
+                    p.tokenizer.clone(),
+                )
+            }
+            Self::Base(p) => {
+                let txs = p.pool.worker_txs();
+                (
+                    &mut p.pool.ready_rx,
+                    &mut p.pool.result_rx,
+                    txs,
+                    p.tokenizer.clone(),
+                )
+            }
+            Self::Small(p) => {
+                let txs = p.pool.worker_txs();
+                (
+                    &mut p.pool.ready_rx,
+                    &mut p.pool.result_rx,
+                    txs,
+                    p.tokenizer.clone(),
+                )
+            }
+            Self::Medium(p) => {
+                let txs = p.pool.worker_txs();
+                (
+                    &mut p.pool.ready_rx,
+                    &mut p.pool.result_rx,
+                    txs,
+                    p.tokenizer.clone(),
+                )
+            }
+            Self::LargeV3Turbo(p) => {
+                let txs = p.pool.worker_txs();
+                (
+                    &mut p.pool.ready_rx,
+                    &mut p.pool.result_rx,
+                    txs,
+                    p.tokenizer.clone(),
+                )
+            }
+        }
+    }
+
     fn load(lib: &Path, files: ModelFiles) -> Result<(Self, Option<VadModel>)> {
         let vad = if let Some(path) = &files.vad {
             let config = VadConfig::default();

@@ -73,6 +73,7 @@ impl ModelBytes {
 
 #[derive(Clone)]
 pub struct WhisperJob {
+    pub job_id: usize,
     pub window_index: usize,
     pub absolute_start_sec: f32,
     pub start_sample: usize,
@@ -80,6 +81,11 @@ pub struct WhisperJob {
     pub samples: Arc<[f32]>,
     pub tokenizer: Arc<Tokenizer>,
     pub options: Arc<TranscribeOptions>,
+}
+
+pub struct WorkerTranscription {
+    pub job_id: usize,
+    pub transcription: WindowTranscription,
 }
 
 pub struct LiveWindow {
@@ -185,7 +191,7 @@ pub fn transcribe_audio_parallel_with_options<S: WhisperSpec + Send + 'static>(
 pub struct ParallelTranscriberPool<S: WhisperSpec + Send + 'static> {
     workers: Vec<Worker>,
     pub ready_rx: mpsc::Receiver<Ready>,
-    pub result_rx: mpsc::Receiver<Result<WindowTranscription>>,
+    pub result_rx: mpsc::Receiver<Result<WorkerTranscription>>,
     runtime: tokio::runtime::Runtime,
     _spec: std::marker::PhantomData<S>,
 }
@@ -195,7 +201,7 @@ impl<S: WhisperSpec + Send + 'static> ParallelTranscriberPool<S> {
         let model_bytes = Arc::new(ModelBytes::read(model_paths)?);
         let lib = lib.to_path_buf();
         let (ready_tx, ready_rx) = mpsc::channel::<Ready>(NPU_WORKERS);
-        let (result_tx, result_rx) = mpsc::channel::<Result<WindowTranscription>>(NPU_WORKERS);
+        let (result_tx, result_rx) = mpsc::channel::<Result<WorkerTranscription>>(NPU_WORKERS);
 
         let mut workers = Vec::with_capacity(NPU_WORKERS);
         for (worker_id, &core_mask) in CORE_MASKS.iter().enumerate() {
@@ -306,7 +312,7 @@ fn spawn_npu_worker<S: WhisperSpec + Send + 'static>(
     lib: PathBuf,
     model_bytes: Arc<ModelBytes>,
     ready_tx: mpsc::Sender<Ready>,
-    result_tx: mpsc::Sender<Result<WindowTranscription>>,
+    result_tx: mpsc::Sender<Result<WorkerTranscription>>,
 ) -> Result<Worker> {
     let (job_tx, mut job_rx) = mpsc::channel::<WhisperJob>(1);
     let join = std::thread::Builder::new()
@@ -327,9 +333,14 @@ fn spawn_npu_worker<S: WhisperSpec + Send + 'static>(
                 .map_err(|_| anyhow!("worker {worker_id} ready channel closed"))?;
 
             while let Some(job) = job_rx.blocking_recv() {
+                let job_id = job.job_id;
                 let window_index = job.window_index;
                 let result = ctx
                     .transcribe_window(job)
+                    .map(|transcription| WorkerTranscription {
+                        job_id,
+                        transcription,
+                    })
                     .with_context(|| format!("worker {worker_id} failed on window {window_index}"));
                 result_tx
                     .blocking_send(result)
@@ -371,6 +382,7 @@ async fn dispatch_windows(
             .send(WhisperJob {
                 window_index: window.index,
                 absolute_start_sec: crate::vad::samples_to_sec(window.start_sample),
+                job_id: 0,
                 start_sample: window.start_sample,
                 end_sample: window.end_sample,
                 samples: Arc::<[f32]>::from(audio[window.start_sample..window.end_sample].to_vec()),
@@ -385,7 +397,7 @@ async fn dispatch_windows(
 }
 
 async fn collect_ordered_with_callback<F>(
-    result_rx: &mut mpsc::Receiver<Result<WindowTranscription>>,
+    result_rx: &mut mpsc::Receiver<Result<WorkerTranscription>>,
     total_windows: usize,
     vad_segments: Vec<crate::vad::VadSegment>,
     mut on_segment: F,
@@ -403,6 +415,7 @@ where
             .recv()
             .await
             .ok_or_else(|| anyhow!("result channel closed before all windows completed"))??;
+        let result = result.transcription;
         pending.insert(result.window_index, result);
 
         while let Some(result) = pending.remove(&next) {
@@ -432,9 +445,9 @@ mod tests {
     #[tokio::test]
     async fn collect_ordered_reorders_results() {
         let (tx, rx) = mpsc::channel(3);
-        tx.send(Ok(window_result(2, "three"))).await.unwrap();
-        tx.send(Ok(window_result(0, "one"))).await.unwrap();
-        tx.send(Ok(window_result(1, "two"))).await.unwrap();
+        tx.send(Ok(worker_result(2, "three"))).await.unwrap();
+        tx.send(Ok(worker_result(0, "one"))).await.unwrap();
+        tx.send(Ok(worker_result(1, "two"))).await.unwrap();
         drop(tx);
 
         let mut rx = rx;
@@ -456,12 +469,15 @@ mod tests {
         assert!(error.to_string().contains("result channel closed"));
     }
 
-    fn window_result(window_index: usize, text: &str) -> WindowTranscription {
-        WindowTranscription {
-            window_index,
-            absolute_start_sec: 0.0,
-            text: text.to_string(),
-            segments: Vec::new(),
+    fn worker_result(window_index: usize, text: &str) -> super::WorkerTranscription {
+        super::WorkerTranscription {
+            job_id: 0,
+            transcription: WindowTranscription {
+                window_index,
+                absolute_start_sec: 0.0,
+                text: text.to_string(),
+                segments: Vec::new(),
+            },
         }
     }
 }

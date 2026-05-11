@@ -46,6 +46,10 @@ pub struct DaemonConfig {
 pub struct ConcurrencyConfig {
     #[serde(default = "default_model_queue_depth")]
     pub model_queue_depth: usize,
+    #[serde(default = "default_max_active_jobs_per_model")]
+    pub max_active_jobs_per_model: usize,
+    #[serde(default = "default_max_in_flight_windows_per_job")]
+    pub max_in_flight_windows_per_job: usize,
     #[serde(default = "default_client_window_queue_depth")]
     pub client_window_queue_depth: usize,
     #[serde(default = "default_client_response_queue_depth")]
@@ -56,6 +60,8 @@ impl Default for ConcurrencyConfig {
     fn default() -> Self {
         Self {
             model_queue_depth: default_model_queue_depth(),
+            max_active_jobs_per_model: default_max_active_jobs_per_model(),
+            max_in_flight_windows_per_job: default_max_in_flight_windows_per_job(),
             client_window_queue_depth: default_client_window_queue_depth(),
             client_response_queue_depth: default_client_response_queue_depth(),
         }
@@ -221,6 +227,12 @@ fn validate_concurrency_config(config: &ConcurrencyConfig) -> Result<()> {
     if config.model_queue_depth == 0 {
         bail!("concurrency.model_queue_depth must be at least 1");
     }
+    if config.max_active_jobs_per_model == 0 {
+        bail!("concurrency.max_active_jobs_per_model must be at least 1");
+    }
+    if config.max_in_flight_windows_per_job == 0 {
+        bail!("concurrency.max_in_flight_windows_per_job must be at least 1");
+    }
     if config.client_window_queue_depth == 0 {
         bail!("concurrency.client_window_queue_depth must be at least 1");
     }
@@ -231,6 +243,14 @@ fn validate_concurrency_config(config: &ConcurrencyConfig) -> Result<()> {
 }
 
 fn default_model_queue_depth() -> usize {
+    1
+}
+
+fn default_max_active_jobs_per_model() -> usize {
+    1
+}
+
+fn default_max_in_flight_windows_per_job() -> usize {
     1
 }
 
@@ -301,6 +321,8 @@ models = [
         assert!(model_is_enabled(&config, "whisper-medium-30s"));
         assert!(!model_is_enabled(&config, "whisper-base-30s"));
         assert_eq!(config.concurrency.model_queue_depth, 1);
+        assert_eq!(config.concurrency.max_active_jobs_per_model, 1);
+        assert_eq!(config.concurrency.max_in_flight_windows_per_job, 1);
         assert_eq!(config.concurrency.client_window_queue_depth, 4);
         assert_eq!(config.concurrency.client_response_queue_depth, 16);
     }
@@ -313,6 +335,8 @@ models = ["whisper-small-30s"]
 
 [concurrency]
 model_queue_depth = 2
+max_active_jobs_per_model = 3
+max_in_flight_windows_per_job = 2
 client_window_queue_depth = 8
 client_response_queue_depth = 32
 "#,
@@ -320,6 +344,8 @@ client_response_queue_depth = 32
         .unwrap();
 
         assert_eq!(config.concurrency.model_queue_depth, 2);
+        assert_eq!(config.concurrency.max_active_jobs_per_model, 3);
+        assert_eq!(config.concurrency.max_in_flight_windows_per_job, 2);
         assert_eq!(config.concurrency.client_window_queue_depth, 8);
         assert_eq!(config.concurrency.client_response_queue_depth, 32);
     }
@@ -364,6 +390,32 @@ model_queue_depth = 0
             .unwrap_err()
             .to_string()
             .contains("model_queue_depth")
+        );
+        assert!(
+            parse_config(
+                r#"
+models = ["whisper-small-30s"]
+
+[concurrency]
+max_active_jobs_per_model = 0
+"#
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("max_active_jobs_per_model")
+        );
+        assert!(
+            parse_config(
+                r#"
+models = ["whisper-small-30s"]
+
+[concurrency]
+max_in_flight_windows_per_job = 0
+"#
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("max_in_flight_windows_per_job")
         );
     }
 

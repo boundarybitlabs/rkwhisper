@@ -88,6 +88,8 @@ models = [
 
 [concurrency]
 model_queue_depth = 1
+max_active_jobs_per_model = 1
+max_in_flight_windows_per_job = 1
 client_window_queue_depth = 4
 client_response_queue_depth = 16
 ```
