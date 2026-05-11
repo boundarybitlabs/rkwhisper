@@ -529,9 +529,14 @@ struct ActiveLiveJob {
     producer_closed: bool,
     pending_results: BTreeMap<usize, WindowTranscription>,
     next_result_index: usize,
-    speech_active: bool,
     tokenizer: Arc<Tokenizer>,
     options: Arc<TranscribeOptions>,
+}
+
+struct DispatchPlan {
+    start_sample: usize,
+    end_sample: usize,
+    speech_events: Vec<(usize, usize)>,
 }
 
 impl ActiveLiveJob {
@@ -576,7 +581,6 @@ impl ActiveLiveJob {
             producer_closed: false,
             pending_results: BTreeMap::new(),
             next_result_index: 0,
-            speech_active: false,
             tokenizer,
             options,
         }
@@ -589,11 +593,6 @@ impl ActiveLiveJob {
     fn finish_if_complete(&mut self) -> bool {
         if !self.is_complete() {
             return false;
-        }
-        if self.speech_active {
-            self.speech_active = false;
-            let end = rkwhisper::vad::samples_to_sec(self.absolute_offset_samples);
-            let _ = self.response_tx.send(JobResponse::SpeechEnded { end });
         }
         let _ = self.response_tx.send(JobResponse::Finished(Ok(self.stats)));
         true
@@ -645,18 +644,6 @@ impl ActiveLiveJob {
                 vad.config(),
             );
 
-            if !segments.is_empty() && !self.speech_active {
-                self.speech_active = true;
-                let begin = rkwhisper::vad::samples_to_sec(
-                    self.absolute_offset_samples + segments[0].start_sample,
-                );
-                let _ = self.response_tx.send(JobResponse::SpeechStarted { begin });
-            } else if segments.is_empty() && self.speech_active {
-                self.speech_active = false;
-                let end = rkwhisper::vad::samples_to_sec(self.absolute_offset_samples);
-                let _ = self.response_tx.send(JobResponse::SpeechEnded { end });
-            }
-
             if segments.is_empty() && self.producer_closed {
                 self.absolute_offset_samples += self.audio_buffer.len();
                 self.audio_buffer.clear();
@@ -665,7 +652,7 @@ impl ActiveLiveJob {
         }
     }
 
-    fn next_dispatch_span(&self) -> Option<(usize, usize)> {
+    fn next_dispatch_plan(&self) -> Option<DispatchPlan> {
         if let Some(vad) = &self.streaming_vad {
             let segments = rkwhisper::vad::segments_from_probs(
                 self.audio_buffer.len(),
@@ -699,12 +686,25 @@ impl ActiveLiveJob {
                 } else {
                     last_fitting_seg.end_sample
                 };
-                return Some((first_seg.start_sample, dispatch_end));
+                let speech_events = segments
+                    .iter()
+                    .take(last_fitting_idx + 1)
+                    .map(|segment| (segment.start_sample, segment.end_sample.min(dispatch_end)))
+                    .collect();
+                return Some(DispatchPlan {
+                    start_sample: first_seg.start_sample,
+                    end_sample: dispatch_end,
+                    speech_events,
+                });
             }
         } else if self.audio_buffer.len() >= 480000
             || (self.producer_closed && !self.audio_buffer.is_empty())
         {
-            return Some((0, 480000.min(self.audio_buffer.len())));
+            return Some(DispatchPlan {
+                start_sample: 0,
+                end_sample: 480000.min(self.audio_buffer.len()),
+                speech_events: Vec::new(),
+            });
         }
 
         None
@@ -715,9 +715,17 @@ impl ActiveLiveJob {
         worker_id: usize,
         worker_txs: &[mpsc::Sender<WhisperJob>],
     ) {
-        let Some((start, end)) = self.next_dispatch_span() else {
+        let Some(plan) = self.next_dispatch_plan() else {
             return;
         };
+        for (start, end) in &plan.speech_events {
+            let begin = rkwhisper::vad::samples_to_sec(self.absolute_offset_samples + start);
+            let end = rkwhisper::vad::samples_to_sec(self.absolute_offset_samples + end);
+            let _ = self.response_tx.send(JobResponse::SpeechStarted { begin });
+            let _ = self.response_tx.send(JobResponse::SpeechEnded { end });
+        }
+        let start = plan.start_sample;
+        let end = plan.end_sample;
         let samples = self.audio_buffer.drain(..end).collect::<Vec<_>>();
         let segment_samples = samples[start..].to_vec();
         let window_start_sec = rkwhisper::vad::samples_to_sec(self.absolute_offset_samples + start);
@@ -893,7 +901,7 @@ async fn dispatch_ready_live_windows(
             let idx = *dispatch_cursor % active_jobs.len();
             *dispatch_cursor = (*dispatch_cursor + 1) % active_jobs.len();
             let job = &active_jobs[idx];
-            if job.in_flight < max_in_flight_windows_per_job && job.next_dispatch_span().is_some() {
+            if job.in_flight < max_in_flight_windows_per_job && job.next_dispatch_plan().is_some() {
                 selected = Some(idx);
                 break;
             }
