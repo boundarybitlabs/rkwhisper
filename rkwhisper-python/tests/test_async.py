@@ -1,7 +1,6 @@
 import pytest
 import wave
 import os
-import asyncio
 from pathlib import Path
 from rkwhisper_client import ClientHello, Segment, SpeechStarted, SpeechEnded
 
@@ -62,11 +61,6 @@ async def test_async_connect_invalid_model(async_session_factory):
     
     hello = ClientHello(model="whisper-invalid-async")
     socket_path = os.getenv("RKWHISPER_SOCKET", "/run/rkwhisper/asr.sock")
-    
-    with pytest.raises(RuntimeError) as excinfo:
-        await AsyncSession.connect(socket_path, hello)
-    assert "model not found" in str(excinfo.value).lower()
-t_path = os.getenv("RKWHISPER_SOCKET", "/run/rkwhisper/asr.sock")
     
     with pytest.raises(RuntimeError) as excinfo:
         await AsyncSession.connect(socket_path, hello)
