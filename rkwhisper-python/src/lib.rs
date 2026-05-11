@@ -631,44 +631,6 @@ impl AsyncSession {
         ))
     }
 
-    fn send_audio<'py>(
-        &mut self,
-        _py: Python<'py>,
-        _pcm: pyo3::buffer::PyBuffer<u8>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        Err(PyRuntimeError::new_err(
-            "send_audio on AsyncSession is deprecated; use split()",
-        ))
-    }
-
-    fn finish<'py>(&mut self, _py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        Err(PyRuntimeError::new_err(
-            "finish on AsyncSession is deprecated; use split()",
-        ))
-    }
-
-    fn cancel<'py>(&mut self, _py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        Err(PyRuntimeError::new_err(
-            "cancel on AsyncSession is deprecated; use split()",
-        ))
-    }
-
-    fn recv_response<'py>(&mut self, _py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        Err(PyRuntimeError::new_err(
-            "recv_response on AsyncSession is deprecated; use split()",
-        ))
-    }
-
-    fn __aiter__(slf: Py<Self>) -> Py<Self> {
-        slf
-    }
-
-    fn __anext__<'py>(&mut self, _py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        Err(PyRuntimeError::new_err(
-            "Async iterator on AsyncSession is deprecated; use split()",
-        ))
-    }
-
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
     }

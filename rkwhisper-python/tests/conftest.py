@@ -50,12 +50,9 @@ async def async_session_factory():
     yield _create
 
     for s in sessions:
-        try:
-            # AsyncSession methods now return Err if split, which future_into_py 
-            # turns into a Python exception.
-            await s.cancel()
-        except Exception:
-            pass
+        # AsyncSession is only a connection owner. Audio control lives on the
+        # split sender half, so there is nothing to cancel here.
+        _ = s
 
 
 @pytest.fixture

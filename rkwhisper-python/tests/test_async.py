@@ -16,6 +16,7 @@ async def test_async_transcribe_audio(async_session_factory):
         model=TEST_MODEL, client_id="pytest-async-stream", mode="stream"
     )
     session = await async_session_factory(hello)
+    sender, receiver = session.split()
     
     assert WAV_PATH is not None, f"No .wav fixtures found in {FIXTURES_DIR}"
     
@@ -30,16 +31,16 @@ async def test_async_transcribe_audio(async_session_factory):
     # Send audio in chunks
     chunk_size = 16000 * 2 # 1 second
     for i in range(0, len(pcm_data), chunk_size):
-        await session.send_audio(pcm_data[i : i + chunk_size])
+        await sender.send_audio(pcm_data[i : i + chunk_size])
     
-    await session.finish()
+    await sender.finish()
 
     results = []
     speech_started = False
     speech_ended = False
 
     # Use the async iterator protocol
-    async for resp in session:
+    async for resp in receiver:
         if isinstance(resp, Segment):
             results.append(resp.text)
         elif isinstance(resp, SpeechStarted):
