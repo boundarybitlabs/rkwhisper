@@ -64,7 +64,6 @@ pub struct VadOptions {
 #[derive(Clone, Debug)]
 pub struct ClientHello {
     pub model: String,
-    pub mode: String,
     pub lang: String,
     pub task: String,
     pub max_new_tokens: usize,
@@ -80,7 +79,6 @@ impl Default for ClientHello {
     fn default() -> Self {
         Self {
             model: String::new(),
-            mode: "batch".to_string(),
             lang: "en".to_string(),
             task: "transcribe".to_string(),
             max_new_tokens: 128,
@@ -143,9 +141,6 @@ pub fn supported_audio_format() -> AudioFormat {
 }
 
 pub fn validate_client_hello(hello: &ClientHello) -> Result<()> {
-    if hello.mode != "batch" && hello.mode != "stream" {
-        return Err(Error::Invalid(format!("unsupported mode {:?}", hello.mode)));
-    }
     if hello.beam_size == 0 {
         return Err(Error::Invalid("beam_size must be at least 1".to_string()));
     }
@@ -587,7 +582,6 @@ pub fn decode_client_hello(bytes: &[u8]) -> Result<ClientHello> {
         let (field, wire) = input.key()?;
         match (field, wire) {
             (1, 2) => hello.model = input.string()?,
-            (2, 2) => hello.mode = input.string()?,
             (3, 2) => hello.lang = input.string()?,
             (4, 2) => hello.task = input.string()?,
             (5, 0) => hello.max_new_tokens = input.varint()? as usize,
@@ -717,7 +711,6 @@ fn encode_audio_format(format: &AudioFormat) -> Vec<u8> {
 pub fn encode_client_hello(hello: &ClientHello) -> Vec<u8> {
     let mut out = Vec::new();
     field_string(&mut out, 1, &hello.model);
-    field_string(&mut out, 2, &hello.mode);
     field_string(&mut out, 3, &hello.lang);
     field_string(&mut out, 4, &hello.task);
     field_varint(&mut out, 5, hello.max_new_tokens as u64);
@@ -1031,7 +1024,6 @@ mod tests {
 
         let mut msg = Vec::new();
         field_string(&mut msg, 1, "whisper-small-30s");
-        field_string(&mut msg, 2, "stream");
         field_varint(&mut msg, 6, 2);
         field_message(&mut msg, 9, &audio);
         field_message(&mut msg, 10, &vad);
@@ -1039,7 +1031,6 @@ mod tests {
 
         let hello = decode_client_hello(&msg).unwrap();
         assert_eq!(hello.model, "whisper-small-30s");
-        assert_eq!(hello.mode, "stream");
         assert_eq!(hello.beam_size, 2);
         assert_eq!(hello.audio_format.sample_rate, 16_000);
         assert_eq!(hello.vad.min_speech_ms, Some(300));
