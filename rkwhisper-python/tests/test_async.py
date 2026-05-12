@@ -11,9 +11,7 @@ WAV_PATH = next(FIXTURES_DIR.glob("*.wav"), None)
 @pytest.mark.asyncio
 async def test_async_transcribe_audio(async_session_factory):
     """End-to-end async transcription test."""
-    hello = ClientHello(
-        model=TEST_MODEL, client_id="pytest-async-stream", mode="stream"
-    )
+    hello = ClientHello(model=TEST_MODEL, client_id="pytest-async-stream")
     session = await async_session_factory(hello)
     sender, receiver = session.split()
     

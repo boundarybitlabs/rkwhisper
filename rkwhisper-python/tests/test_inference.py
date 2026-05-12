@@ -13,10 +13,8 @@ WAV_PATH = next(FIXTURES_DIR.glob("*.wav"), None)
 
 @pytest.fixture
 def stream_hello():
-    """ClientHello with streaming mode enabled."""
-    return ClientHello(
-        model=TEST_MODEL, client_id="pytest-stream", mode="stream"
-    )
+    """ClientHello for a streaming session."""
+    return ClientHello(model=TEST_MODEL, client_id="pytest-stream")
 
 def test_transcribe_audio(session_factory, stream_hello):
     """End-to-end transcription test using a sample from fixtures."""
@@ -72,4 +70,3 @@ def test_transcribe_audio(session_factory, stream_hello):
     # verify speech events were received (assuming the audio has speech)
     assert speech_started
     assert speech_ended
-

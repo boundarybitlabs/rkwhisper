@@ -60,7 +60,6 @@ class ClientHello:
 
     Attributes:
         model: Model id enabled by the daemon, such as ``"whisper-small-30s"``.
-        mode: Session mode. Common values are ``"batch"`` and ``"stream"``.
         lang: Language code used by the decoder, for example ``"en"``.
         task: Whisper task, typically ``"transcribe"`` or ``"translate"``.
         max_new_tokens: Maximum number of decoded tokens per window.
@@ -72,7 +71,6 @@ class ClientHello:
         client_id: Optional human-readable id for logs and diagnostics.
     """
     model: str
-    mode: str
     lang: str
     task: str
     max_new_tokens: int
@@ -85,7 +83,6 @@ class ClientHello:
     def __init__(
         self,
         model: str,
-        mode: str = "batch",
         lang: str = "en",
         task: str = "transcribe",
         max_new_tokens: int = 128,
