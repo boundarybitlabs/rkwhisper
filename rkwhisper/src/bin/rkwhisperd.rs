@@ -4,8 +4,7 @@ use rknpu2::utils::find_rknn_library;
 use rkwhisper::{
     daemon::{
         ConcurrencyConfig, DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH, DaemonConfig, ModelFiles,
-        ModelKind, RequestHeader, default_model_root, load_config, pcm_s16le_to_f32,
-        resolve_enabled_model_files,
+        ModelKind, RequestHeader, default_model_root, load_config, resolve_enabled_model_files,
     },
     daemon_stream::{LiveChunk, ReadOutcome, read_live_chunks},
     parallel::{
@@ -13,19 +12,19 @@ use rkwhisper::{
         ParallelTranscriberPool, Ready, VadJob, VadResult, WhisperJob,
     },
     protocol::{
-        RING_DATA_BYTES, Response, SIGNAL_CANCEL, SIGNAL_DATA_READY, SIGNAL_END_OF_STREAM,
-        ServerHello, SharedAudioRing, read_client_hello, validate_client_hello, write_response,
+        RING_DATA_BYTES, Response, ServerHello, SharedAudioRing, read_client_hello,
+        validate_client_hello, write_response,
     },
     spec::{
         WhisperBase, WhisperLargeV3Turbo, WhisperMedium, WhisperSmall, WhisperSpec, WhisperTiny,
     },
     suppression::SuppressTokens,
     vad::VadConfig,
-    whisper::{TranscribeOptions, Transcription, WindowTranscription},
+    whisper::{TranscribeOptions, WindowTranscription},
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
-use std::io::{BufWriter, Read};
+use std::io::BufWriter;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -34,7 +33,6 @@ use std::time::Instant;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
-use tracing::{debug, trace};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "RKWhisper Unix socket ASR daemon")]
@@ -148,8 +146,8 @@ fn handle_connection(
     }
 
     eprintln!(
-        "session started: client_id={:?} model={} mode={}",
-        client_id, header.model, header.mode
+        "session started: client_id={:?} model={}",
+        client_id, header.model
     );
 
     let ring = match SharedAudioRing::create(RING_DATA_BYTES) {
@@ -175,10 +173,6 @@ fn handle_connection(
         .context("failed to clone stream for live reader")?;
     let mut writer = BufWriter::new(stream);
     let started = Instant::now();
-
-    if header.mode == "batch" {
-        return handle_batch_connection(&mut writer, reader, ring, schedulers, header, started);
-    }
 
     let (window_tx, window_rx) =
         mpsc::channel::<Result<LiveChunk>>(concurrency.client_window_queue_depth);
@@ -242,102 +236,6 @@ fn handle_connection(
             &mut writer.into_inner()?,
             "model scheduler thread exited unexpectedly",
         )?;
-    }
-
-    Ok(())
-}
-
-fn handle_batch_connection(
-    writer: &mut BufWriter<UnixStream>,
-    mut reader_stream: UnixStream,
-    ring: SharedAudioRing,
-    schedulers: ModelSchedulers,
-    header: RequestHeader,
-    started: Instant,
-) -> Result<()> {
-    let mut pcm = Vec::<u8>::new();
-    loop {
-        let mut signal = [0u8; 1];
-        let n = reader_stream
-            .read(&mut signal)
-            .context("failed to read shared-memory signal")?;
-        if n == 0 {
-            break;
-        }
-        match signal[0] {
-            SIGNAL_DATA_READY => {
-                ring.drain_available(&mut pcm)?;
-            }
-            SIGNAL_END_OF_STREAM => {
-                ring.drain_available(&mut pcm)?;
-                break;
-            }
-            SIGNAL_CANCEL => return Ok(()),
-            _ => {}
-        }
-    }
-
-    let audio = pcm_s16le_to_f32(&pcm)?;
-    let audio_s = rkwhisper::daemon::audio_seconds(audio.len());
-
-    let (response_tx, response_rx) = std_mpsc::sync_channel::<JobResponse>(128);
-
-    if let Err(error) = schedulers.submit_batch(header.clone(), audio, response_tx) {
-        let response = match error {
-            SubmitError::QueueFull(reason) => Response::BackOff {
-                reason,
-                retry_after_ms: 250,
-            },
-            SubmitError::UnknownModel => Response::Error {
-                error: "model not found".to_string(),
-            },
-            SubmitError::SchedulerStopped(reason) => Response::Error { error: reason },
-        };
-        write_response(writer, response)?;
-        return Ok(());
-    }
-
-    while let Ok(response) = response_rx.recv() {
-        match response {
-            JobResponse::Segment { text, begin, end } => {
-                write_response(writer, Response::Segment { text, begin, end })?;
-            }
-            JobResponse::SpeechStarted { begin } => {
-                write_response(writer, Response::SpeechStarted { begin })?;
-            }
-            JobResponse::SpeechEnded { end } => {
-                write_response(writer, Response::SpeechEnded { end })?;
-            }
-            JobResponse::Finished(result) => {
-                match result {
-                    Ok(stats) => {
-                        eprintln!(
-                            "batch completed: dispatched={} completed={}",
-                            stats.windows_dispatched, stats.windows_completed
-                        );
-                        write_response(
-                            writer,
-                            Response::Done {
-                                audio_s,
-                                rtf: rkwhisper::daemon::real_time_factor(
-                                    started.elapsed(),
-                                    audio_s,
-                                ),
-                            },
-                        )?;
-                    }
-                    Err(error) => {
-                        write_response(
-                            writer,
-                            Response::Error {
-                                error: error.to_string(),
-                            },
-                        )?;
-                    }
-                }
-                return Ok(());
-            }
-        }
     }
 
     Ok(())
@@ -416,11 +314,6 @@ enum ModelJob {
         chunk_rx: mpsc::Receiver<Result<LiveChunk>>,
         response_tx: std_mpsc::SyncSender<JobResponse>,
     },
-    Batch {
-        header: RequestHeader,
-        audio: Vec<f32>,
-        response_tx: std_mpsc::SyncSender<JobResponse>,
-    },
 }
 
 #[derive(Clone)]
@@ -467,30 +360,6 @@ impl ModelSchedulers {
             .try_send(ModelJob::Live {
                 header,
                 chunk_rx,
-                response_tx,
-            })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => SubmitError::QueueFull("model queue full".to_string()),
-                TrySendError::Closed(_) => {
-                    SubmitError::SchedulerStopped("model scheduler stopped".to_string())
-                }
-            })
-    }
-
-    fn submit_batch(
-        &self,
-        header: RequestHeader,
-        audio: Vec<f32>,
-        response_tx: std_mpsc::SyncSender<JobResponse>,
-    ) -> Result<(), SubmitError> {
-        let job_tx = self
-            .schedulers
-            .get(&header.model)
-            .ok_or(SubmitError::UnknownModel)?;
-        job_tx
-            .try_send(ModelJob::Batch {
-                header,
-                audio,
                 response_tx,
             })
             .map_err(|error| match error {
@@ -824,7 +693,7 @@ async fn run_live_jobs(
     let max_active_jobs = concurrency.max_active_jobs_per_model;
     let max_in_flight_windows_per_job = concurrency.max_in_flight_windows_per_job.min(NPU_WORKERS);
     let mut active_jobs = Vec::<ActiveLiveJob>::from([initial_job]);
-    let mut deferred_jobs = VecDeque::new();
+    let deferred_jobs = VecDeque::new();
     let mut dispatch_cursor = 0usize;
 
     while !active_jobs.is_empty() {
@@ -849,9 +718,6 @@ async fn run_live_jobs(
                         );
                         *next_job_id += 1;
                         active_jobs.push(active_job);
-                    }
-                    Some(job @ ModelJob::Batch { .. }) => {
-                        deferred_jobs.push_back(job);
                     }
                     None => {}
                 }
@@ -1058,95 +924,6 @@ fn spawn_model_scheduler(
                         ));
                         deferred_jobs.extend(newly_deferred);
                     }
-                    ModelJob::Batch {
-                        header,
-                        audio,
-                        response_tx,
-                    } => {
-                        let segment_tx = response_tx.clone();
-                        let audio_samples = audio.len();
-                        let audio_sec = audio_samples as f32 / rkwhisper::SAMPLE_RATE as f32;
-                        debug!(
-                            audio_samples,
-                            audio_sec,
-                            notimestamps = header.notimestamps,
-                            max_new_tokens = header.max_new_tokens,
-                            vad_threshold = ?header.vad_threshold,
-                            "batch job received"
-                        );
-                        let vad_segments = if pool.has_vad() {
-                            let defaults = rkwhisper::vad::VadConfig::default();
-                            let vad_config = rkwhisper::vad::VadConfig {
-                                threshold: header.vad_threshold.unwrap_or(defaults.threshold),
-                                min_speech_ms: header
-                                    .vad_min_speech_ms
-                                    .unwrap_or(defaults.min_speech_ms),
-                                min_silence_ms: header
-                                    .vad_min_silence_ms
-                                    .unwrap_or(defaults.min_silence_ms),
-                                speech_pad_ms: header
-                                    .vad_speech_pad_ms
-                                    .unwrap_or(defaults.speech_pad_ms),
-                                window_samples: header
-                                    .vad_window_samples
-                                    .unwrap_or(defaults.window_samples),
-                            };
-                            let segs = pool
-                                .vad_segments_with_config(&audio, &vad_config)
-                                .unwrap_or_default();
-                            debug!(vad_segments = segs.len(), "VAD segmentation complete");
-                            for (i, seg) in segs.iter().enumerate() {
-                                trace!(
-                                    i,
-                                    start_sec = seg.start_sec,
-                                    end_sec = seg.end_sec,
-                                    "VAD segment"
-                                );
-                            }
-                            segs
-                        } else {
-                            debug!("no VAD model; using fixed windows");
-                            Vec::new()
-                        };
-
-                        for seg in &vad_segments {
-                            let _ = response_tx.send(JobResponse::SpeechStarted {
-                                begin: seg.start_sec,
-                            });
-                            let _ = response_tx.send(JobResponse::SpeechEnded { end: seg.end_sec });
-                        }
-
-                        let result = pool.transcribe_batch_with_vad(
-                            &header,
-                            &audio,
-                            &vad_segments,
-                            |segment| {
-                                debug!(
-                                    start_sec = segment.start_sec,
-                                    end_sec = segment.end_sec,
-                                    text = %segment.text,
-                                    "batch segment emitted"
-                                );
-                                segment_tx
-                                    .try_send(JobResponse::Segment {
-                                        text: segment.text.clone(),
-                                        begin: segment.start_sec,
-                                        end: segment.end_sec,
-                                    })
-                                    .map_err(|error| match error {
-                                        std_mpsc::TrySendError::Full(_) => {
-                                            anyhow::anyhow!("client response queue full")
-                                        }
-                                        std_mpsc::TrySendError::Disconnected(_) => {
-                                            anyhow::anyhow!("client response channel closed")
-                                        }
-                                    })?;
-                                Ok(())
-                            },
-                        );
-                        let result = result.map(|(_transcription, stats)| stats);
-                        let _ = response_tx.send(JobResponse::Finished(result));
-                    }
                 }
             }
         })
@@ -1168,7 +945,6 @@ fn write_error(stream: &UnixStream, error: &str) -> Result<()> {
 fn request_header_from_hello(hello: rkwhisper::protocol::ClientHello) -> RequestHeader {
     RequestHeader {
         model: hello.model,
-        mode: hello.mode,
         lang: hello.lang,
         task: hello.task,
         max_new_tokens: hello.max_new_tokens,
@@ -1272,41 +1048,6 @@ impl ModelPool {
 
         Ok(pool)
     }
-
-    fn vad_segments_with_config(
-        &mut self,
-        audio: &[f32],
-        config: &VadConfig,
-    ) -> Result<Vec<rkwhisper::vad::VadSegment>> {
-        match self {
-            Self::Tiny(pool) => pool.vad_segments_with_config(audio, config),
-            Self::Base(pool) => pool.vad_segments_with_config(audio, config),
-            Self::Small(pool) => pool.vad_segments_with_config(audio, config),
-            Self::Medium(pool) => pool.vad_segments_with_config(audio, config),
-            Self::LargeV3Turbo(pool) => pool.vad_segments_with_config(audio, config),
-        }
-    }
-
-    fn transcribe_batch_with_vad<F>(
-        &mut self,
-        header: &RequestHeader,
-        audio: &[f32],
-        vad_segments: &[rkwhisper::vad::VadSegment],
-        on_segment: F,
-    ) -> Result<(Transcription, LiveTranscriptionStats)>
-    where
-        F: FnMut(&rkwhisper::whisper::TranscriptSegment) -> Result<()>,
-    {
-        match self {
-            Self::Tiny(pool) => pool.transcribe_batch(header, audio, vad_segments, on_segment),
-            Self::Base(pool) => pool.transcribe_batch(header, audio, vad_segments, on_segment),
-            Self::Small(pool) => pool.transcribe_batch(header, audio, vad_segments, on_segment),
-            Self::Medium(pool) => pool.transcribe_batch(header, audio, vad_segments, on_segment),
-            Self::LargeV3Turbo(pool) => {
-                pool.transcribe_batch(header, audio, vad_segments, on_segment)
-            }
-        }
-    }
 }
 
 struct TypedModelPool<S: WhisperSpec + Send + 'static> {
@@ -1341,50 +1082,6 @@ impl<S: WhisperSpec + Send + 'static> TypedModelPool<S> {
 
     fn has_vad(&self) -> bool {
         self.has_vad
-    }
-
-    fn vad_segments_with_config(
-        &mut self,
-        audio: &[f32],
-        config: &VadConfig,
-    ) -> Result<Vec<rkwhisper::vad::VadSegment>> {
-        self.pool.vad_segments_with_config(audio, config)
-    }
-
-    fn transcribe_batch<F>(
-        &mut self,
-        header: &RequestHeader,
-        audio: &[f32],
-        vad_segments: &[rkwhisper::vad::VadSegment],
-        on_segment: F,
-    ) -> Result<(Transcription, LiveTranscriptionStats)>
-    where
-        F: FnMut(&rkwhisper::whisper::TranscriptSegment) -> Result<()>,
-    {
-        let options = TranscribeOptions::new(
-            header.lang.clone(),
-            header.task.clone(),
-            header.notimestamps,
-            header.max_new_tokens,
-            header.beam_size,
-            SuppressTokens::parse(&header.suppress_tokens)?,
-        );
-
-        let transcription = self.pool.transcribe_audio_with_segment_callback(
-            audio,
-            self.tokenizer.clone(),
-            vad_segments,
-            &options,
-            on_segment,
-        )?;
-
-        // Approximate stats for batch
-        let stats = LiveTranscriptionStats {
-            windows_dispatched: (audio.len() + 480000 - 1) / 480000,
-            windows_completed: (audio.len() + 480000 - 1) / 480000,
-        };
-
-        Ok((transcription, stats))
     }
 }
 
@@ -1432,7 +1129,6 @@ mod tests {
     fn test_header(model: &str) -> RequestHeader {
         RequestHeader {
             model: model.to_string(),
-            mode: "stream".to_string(),
             lang: "en".to_string(),
             task: "transcribe".to_string(),
             max_new_tokens: 128,

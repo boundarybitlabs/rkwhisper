@@ -15,7 +15,6 @@ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug)]
 pub struct RequestHeader {
     pub model: String,
-    pub mode: String,
     pub lang: String,
     pub task: String,
     pub max_new_tokens: usize,
