@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
         ..ClientHello::default()
     };
 
-    let mut session = Session::connect(socket_path, hello).await?;
+    let session = Session::connect(socket_path, hello).await?;
     println!("Connected! Handshake successful.");
 
     let (mut sender, mut receiver) = session.split();
