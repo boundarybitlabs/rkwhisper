@@ -24,7 +24,7 @@ scheduling inside every application.
 
 The clients are designed for:
 
-- Batch transcription of short clips
+- One-shot transcription of short clips
 - Live or incremental transcription from an app
 - Async applications that need to send audio and receive segments concurrently
 - Benchmarking transcription speed and real-time factor on target hardware
@@ -195,7 +195,6 @@ from rkwhisper_client import ClientHello, Done, Segment, SyncSession
 
 hello = ClientHello(
     model="whisper-small-30s",
-    mode="stream",
     client_id="my-python-app",
 )
 
@@ -248,7 +247,6 @@ Supported ids:
 
 Clients send a `ClientHello` when opening a session. Defaults are:
 
-- `mode`: `batch`
 - `lang`: `en`
 - `task`: `transcribe`
 - `max_new_tokens`: `128`
@@ -274,13 +272,16 @@ Connection flow:
 
 1. The client sends a length-prefixed `ClientHello`.
 2. The server validates that the requested audio format is 16 kHz mono s16le.
-3. The server creates a 30-second audio ring buffer in a `memfd`.
+3. The server creates a shared audio ring buffer in a `memfd`.
 4. The server sends the `memfd` to the client with `SCM_RIGHTS`.
 5. The server sends a length-prefixed `ServerHello`.
 6. The client writes s16le PCM bytes into the shared ring and sends socket
    signals.
 7. The server replies with `segment`, `done`, `cancelled`, `back_off`, or
    `error` responses.
+
+Every request uses the same streaming protocol. A one-shot transcription sends
+the audio, signals end-of-stream, and then reads responses until `done`.
 
 Signal bytes:
 
