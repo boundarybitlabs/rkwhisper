@@ -1,0 +1,23 @@
+Source: rkwhisper-client
+Section: python
+Priority: optional
+Maintainer: Boyd Johnson <boyd@boundarybit.io>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-python,
+ pybuild-plugin-pyproject,
+ python3-all-dev,
+ python3-build,
+ maturin (>= 1.0),
+ cargo,
+ rustc
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: python3-rkwhisper-client
+Architecture: any
+Depends: ${misc:Depends}, ${python3:Depends}, ${shlibs:Depends}
+Description: Python client for the rkwhisper speech recognition daemon
+ Python bindings for the rkwhisper ASR daemon built with PyO3 and Maturin.
+ Provides synchronous and asynchronous session types for streaming audio to
+ rkwhisperd and receiving transcription segments in real time.

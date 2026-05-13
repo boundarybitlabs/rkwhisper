@@ -1,0 +1,28 @@
+#!/usr/bin/make -f
+
+# pybuild invokes the PEP 517 backend (maturin) via python3-build.
+export PYBUILD_SYSTEM = pyproject
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# pybuild overrides HOME to the build dir; capture real paths before that happens.
+export RUSTUP_HOME := $(HOME)/.rustup
+export CARGO_HOME := $(HOME)/.cargo
+export PATH := $(HOME)/.cargo/bin:$(PATH)
+export RUSTUP_TOOLCHAIN = stable
+export CARGO_NET_OFFLINE = true
+
+PYVERSIONS = 3.12 3.13 3.14
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_build:
+	pybuild --build -p "$(PYVERSIONS)"
+
+override_dh_auto_install:
+	pybuild --install --dest-dir $(CURDIR)/debian/python3-rkwhisper-client \
+		-p "$(PYVERSIONS)"
+
+override_dh_auto_test:
+	pybuild --test -p "$(PYVERSIONS)"
