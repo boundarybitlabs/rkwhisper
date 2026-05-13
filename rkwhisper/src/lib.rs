@@ -114,7 +114,10 @@ pub fn load_audio_file(path: &str) -> Result<Vec<f32>, anyhow::Error> {
     }
 
     let wave: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to read float audio samples")?,
         hound::SampleFormat::Int => {
             // normalize int samples to [-1, 1]
             let max_val = match spec.bits_per_sample {
@@ -126,8 +129,9 @@ pub fn load_audio_file(path: &str) -> Result<Vec<f32>, anyhow::Error> {
             };
             reader
                 .samples::<i32>()
-                .map(|s| s.unwrap() as f32 / max_val)
-                .collect()
+                .map(|s| s.map(|v| v as f32 / max_val))
+                .collect::<Result<Vec<_>, _>>()
+                .context("failed to read integer audio samples")?
         }
     };
 

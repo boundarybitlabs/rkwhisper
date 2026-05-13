@@ -239,7 +239,9 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
     decoder.set_enc_kv(enc_k, enc_v);
 
     let tok_eot = S::TOKEN_EOT;
-    let tok_notimestamps = tokenizer.token_to_id("<|notimestamps|>").unwrap();
+    let tok_notimestamps = tokenizer
+        .token_to_id("<|notimestamps|>")
+        .ok_or_else(|| anyhow!("tokenizer missing <|notimestamps|>"))?;
     let timestamp_begin = tok_notimestamps + 1;
     let window_duration_sec = samples_to_sec(window_end_sample - window_start_sample);
 
@@ -294,12 +296,13 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
             let pass_suppress =
                 |tokens: &[u32], logits: &mut [f32]| pass_suppressor.apply(tokens, logits);
 
+            let prompt_len = prompt.len();
             let new_tokens = if options.beam_size > 1 {
                 let mut beam_search = BeamSearch::<S>::new(
                     options.beam_size,
                     state.clone(),
                     last_logits,
-                    prompt.clone(),
+                    prompt,
                     1.0,
                 );
                 for _ in 0..options.max_new_tokens {
@@ -309,11 +312,11 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
                     }
                 }
                 let full = beam_search.best_result().unwrap_or_default();
-                full.get(prompt.len()..).unwrap_or(&[]).to_vec()
+                full.get(prompt_len..).unwrap_or(&[]).to_vec()
             } else {
                 let mut generated = Vec::new();
                 let mut current_logits = last_logits;
-                let mut tokens_with_prompt = prompt.clone();
+                let mut tokens_with_prompt = prompt;
 
                 for _step in 0..options.max_new_tokens {
                     let mut logits_1d = current_logits.clone();
@@ -362,7 +365,7 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
             let Some(last_ts) = new_last_ts else { break };
 
             // No advancement: model is stuck at or before the previous seek point.
-            if prev_last_ts.map_or(false, |p| last_ts <= p) {
+            if prev_last_ts.is_some_and(|p| last_ts <= p) {
                 break;
             }
 
@@ -433,11 +436,19 @@ fn control_prompt(
     task: &str, // "transcribe" or "translate"
     notimestamps: bool,
 ) -> Result<Vec<u32>> {
-    let start = tok.token_to_id("<|startoftranscript|>").unwrap();
-    let lang = tok.token_to_id(&format!("<|{lang}|>")).unwrap();
-    let task = tok.token_to_id(&format!("<|{task}|>")).unwrap();
-    let nots = tok.token_to_id("<|notimestamps|>").unwrap();
-    let mut prompt = vec![start, lang, task];
+    let start = tok
+        .token_to_id("<|startoftranscript|>")
+        .ok_or_else(|| anyhow!("tokenizer missing <|startoftranscript|>"))?;
+    let lang_tok = tok
+        .token_to_id(&format!("<|{lang}|>"))
+        .ok_or_else(|| anyhow!("tokenizer missing language token <|{lang}|>"))?;
+    let task_tok = tok
+        .token_to_id(&format!("<|{task}|>"))
+        .ok_or_else(|| anyhow!("tokenizer missing task token <|{task}|>"))?;
+    let nots = tok
+        .token_to_id("<|notimestamps|>")
+        .ok_or_else(|| anyhow!("tokenizer missing <|notimestamps|>"))?;
+    let mut prompt = vec![start, lang_tok, task_tok];
     if notimestamps {
         prompt.push(nots);
     }
@@ -491,18 +502,18 @@ fn vad_audio_windows(vad_segments: &[VadSegment]) -> Vec<AudioWindow> {
                 start = end;
             }
         } else {
-            let wall_clock_overflow = group_start.map_or(false, |s| seg.end_sample - s > N_SAMPLES);
+            let wall_clock_overflow = group_start.is_some_and(|s| seg.end_sample - s > N_SAMPLES);
             let speech_overflow = group_speech + seg_len > N_SAMPLES;
 
-            if wall_clock_overflow || speech_overflow {
-                if let Some(start) = group_start.take() {
-                    windows.push(AudioWindow {
-                        index: windows.len(),
-                        start_sample: start,
-                        end_sample: group_end,
-                    });
-                    group_speech = 0;
-                }
+            if (wall_clock_overflow || speech_overflow)
+                && let Some(start) = group_start.take()
+            {
+                windows.push(AudioWindow {
+                    index: windows.len(),
+                    start_sample: start,
+                    end_sample: group_end,
+                });
+                group_speech = 0;
             }
 
             if group_start.is_none() {

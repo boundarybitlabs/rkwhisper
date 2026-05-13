@@ -335,7 +335,7 @@ impl<S: WhisperSpec + Send + 'static> ParallelTranscriberPool<S> {
         }
 
         let total_windows = windows.len();
-        let audio = Arc::<[f32]>::from(audio.to_vec());
+        let audio = Arc::<[f32]>::from(audio);
         let options = Arc::new(options.clone());
         let worker_txs = self
             .workers
@@ -369,7 +369,7 @@ impl<S: WhisperSpec + Send + 'static> ParallelTranscriberPool<S> {
         audio: &[f32],
         config: &VadConfig,
     ) -> Result<Vec<crate::vad::VadSegment>> {
-        let audio = Arc::<[f32]>::from(audio.to_vec());
+        let audio = Arc::<[f32]>::from(audio);
         let worker_txs = self.worker_txs();
         let ready_rx = &mut self.ready_rx;
         let result_rx = &mut self.result_rx;
@@ -539,7 +539,7 @@ async fn dispatch_windows(
                 job_id: 0,
                 start_sample: window.start_sample,
                 end_sample: window.end_sample,
-                samples: Arc::<[f32]>::from(audio[window.start_sample..window.end_sample].to_vec()),
+                samples: Arc::<[f32]>::from(&audio[window.start_sample..window.end_sample]),
                 tokenizer: tokenizer.clone(),
                 options: options.clone(),
             }))

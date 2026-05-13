@@ -169,11 +169,11 @@ pub fn segments_from_probs(
                 current_start = Some(start);
             }
             last_speech_end = end;
-        } else if let Some(segment_start) = current_start {
-            if start.saturating_sub(last_speech_end) >= min_silence {
-                raw.push((segment_start, last_speech_end));
-                current_start = None;
-            }
+        } else if let Some(segment_start) = current_start
+            && start.saturating_sub(last_speech_end) >= min_silence
+        {
+            raw.push((segment_start, last_speech_end));
+            current_start = None;
         }
     }
 
@@ -188,11 +188,11 @@ pub fn segments_from_probs(
         }
         let padded_start = start.saturating_sub(speech_pad);
         let padded_end = (end + speech_pad).min(audio_len);
-        if let Some((_, prev_end)) = merged.last_mut() {
-            if padded_start <= *prev_end {
-                *prev_end = (*prev_end).max(padded_end);
-                continue;
-            }
+        if let Some((_, prev_end)) = merged.last_mut()
+            && padded_start <= *prev_end
+        {
+            *prev_end = (*prev_end).max(padded_end);
+            continue;
         }
         merged.push((padded_start, padded_end));
     }
