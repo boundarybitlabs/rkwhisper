@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  rkwhisperd-deb:
+    name: rkwhisperd .deb
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-unknown-linux-gnu
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build release binary
+        run: cargo build -p rkwhisper --release --target aarch64-unknown-linux-gnu
+
+      - name: Build .deb
+        run: cargo deb -p rkwhisper --no-build --target aarch64-unknown-linux-gnu
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rkwhisperd-deb
+          path: target/aarch64-unknown-linux-gnu/debian/rkwhisperd_*.deb
+
+  python-client-deb:
+    name: python3-rkwhisper-client .deb
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rustup-managed Rust is used for compilation. We pass -d to
+      # dpkg-buildpackage to skip the Build-Depends check for rustc/cargo
+      # since they are not registered as Debian packages here.
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install Debian build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            debhelper \
+            fakeroot \
+            dh-python \
+            pybuild-plugin-pyproject \
+            python3-all-dev \
+            python3-build
+
+      - name: Install maturin
+        run: sudo apt-get install -y python3-maturin
+
+      # Install additional Python versions so pybuild compiles a .so for each:
+      #   3.12 → Ubuntu 24.04 (already present via python3-all-dev)
+      #   3.13 → Ubuntu 25.04
+      #   3.14 → Ubuntu 26.04
+      - name: Install additional Python versions via deadsnakes
+        run: |
+          sudo add-apt-repository -y ppa:deadsnakes/ppa
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3.13-dev \
+            python3.14-dev
+
+      - name: Fetch cargo dependencies
+        run: cargo fetch --manifest-path rkwhisper-python/Cargo.toml
+
+      - name: Build .deb
+        working-directory: rkwhisper-python
+        run: dpkg-buildpackage -us -uc -b -rfakeroot -d
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-client-deb
+          # dpkg-buildpackage places output in the parent of the source tree
+          path: python3-rkwhisper-client_*.deb
+
+  bench-deb:
+    name: rkwhisper-bench .deb
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Debian build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            debhelper \
+            fakeroot \
+            dh-python \
+            pybuild-plugin-pyproject \
+            python3-all \
+            python3-hatchling
+
+      - name: Build .deb
+        working-directory: rkwhisper-bench
+        run: dpkg-buildpackage -us -uc -b -rfakeroot -d
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-deb
+          # dpkg-buildpackage places output in the parent of the source tree
+          path: rkwhisper-bench_*.deb
+
+  release:
+    name: GitHub Release
+    needs: [rkwhisperd-deb, python-client-deb, bench-deb]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - name: Download all debs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-deb'
+          path: dist/
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          generate_release_notes: true
+          fail_on_unmatched_files: true
