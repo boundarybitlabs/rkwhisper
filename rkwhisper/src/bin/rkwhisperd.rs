@@ -233,7 +233,7 @@ fn handle_connection(
 
     if !job_finished {
         write_error(
-            &mut writer.into_inner()?,
+            &writer.into_inner()?,
             "model scheduler thread exited unexpectedly",
         )?;
     }
@@ -843,14 +843,13 @@ async fn dispatch_ready_live_window(
         return;
     };
     if is_vad {
-        if let Some(vad_job) = active_jobs[job_idx].next_vad_job() {
-            if worker_txs[worker_id]
+        if let Some(vad_job) = active_jobs[job_idx].next_vad_job()
+            && worker_txs[worker_id]
                 .send(NpuJob::Vad(vad_job))
                 .await
                 .is_err()
-            {
-                active_jobs[job_idx].vad_in_flight = false;
-            }
+        {
+            active_jobs[job_idx].vad_in_flight = false;
         }
     } else {
         active_jobs[job_idx]

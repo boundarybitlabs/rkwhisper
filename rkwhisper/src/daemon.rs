@@ -108,7 +108,7 @@ pub fn parse_config(contents: &str) -> Result<DaemonConfig> {
 }
 
 pub fn pcm_s16le_to_f32(pcm: &[u8]) -> Result<Vec<f32>> {
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         bail!("PCM byte count must be even for s16le audio");
     }
     Ok(pcm

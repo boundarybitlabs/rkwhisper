@@ -99,13 +99,12 @@ impl TokenSuppressor {
         // timestamp as its first generated token.  Checking tokens.last()
         // (which includes the prompt) was incorrectly blocking that echo and
         // forcing the model to start with text, sometimes from before the seek.
-        if let Some(generated) = tokens.get(self.prompt_len..) {
-            if let Some(&last) = generated.last() {
-                if last >= self.timestamp_begin {
-                    for i in (self.timestamp_begin as usize)..logits.len() {
-                        logits[i] = -1e4;
-                    }
-                }
+        if let Some(generated) = tokens.get(self.prompt_len..)
+            && let Some(&last) = generated.last()
+            && last >= self.timestamp_begin
+        {
+            for i in (self.timestamp_begin as usize)..logits.len() {
+                logits[i] = -1e4;
             }
         }
 
@@ -113,13 +112,14 @@ impl TokenSuppressor {
         // We track seen tokens to apply the penalty only once per unique token.
         let mut seen = HashSet::new();
         for &id in tokens.iter().skip(self.prompt_len) {
-            if id < self.sot && seen.insert(id) {
-                if let Some(logit) = logits.get_mut(id as usize) {
-                    if *logit > 0.0 {
-                        *logit /= 1.1; // Slightly milder penalty
-                    } else {
-                        *logit *= 1.1;
-                    }
+            if id < self.sot
+                && seen.insert(id)
+                && let Some(logit) = logits.get_mut(id as usize)
+            {
+                if *logit > 0.0 {
+                    *logit /= 1.1; // Slightly milder penalty
+                } else {
+                    *logit *= 1.1;
                 }
             }
         }

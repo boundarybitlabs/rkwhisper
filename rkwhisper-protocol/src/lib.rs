@@ -166,7 +166,7 @@ pub fn write_response(writer: &mut impl Write, response: Response) -> Result<()>
 
 pub fn read_frame(reader: &mut impl Read) -> Result<Vec<u8>> {
     let mut len = [0u8; 4];
-    reader.read_exact(&mut len).map_err(|e| Error::Io(e))?;
+    reader.read_exact(&mut len).map_err(Error::Io)?;
     let len = u32::from_le_bytes(len) as usize;
     if len > FRAME_MAX_BYTES {
         return Err(Error::Proto(format!(
@@ -174,7 +174,7 @@ pub fn read_frame(reader: &mut impl Read) -> Result<Vec<u8>> {
         )));
     }
     let mut frame = vec![0u8; len];
-    reader.read_exact(&mut frame).map_err(|e| Error::Io(e))?;
+    reader.read_exact(&mut frame).map_err(Error::Io)?;
     Ok(frame)
 }
 
@@ -186,9 +186,9 @@ pub fn write_frame(writer: &mut impl Write, frame: &[u8]) -> Result<()> {
     }
     writer
         .write_all(&(frame.len() as u32).to_le_bytes())
-        .map_err(|e| Error::Io(e))?;
-    writer.write_all(frame).map_err(|e| Error::Io(e))?;
-    writer.flush().map_err(|e| Error::Io(e))?;
+        .map_err(Error::Io)?;
+    writer.write_all(frame).map_err(Error::Io)?;
+    writer.flush().map_err(Error::Io)?;
     Ok(())
 }
 
@@ -250,9 +250,7 @@ pub fn recv_response_with_fd(stream: &UnixStream) -> Result<(Response, Option<Ow
 
     let mut body = vec![0u8; len];
     let mut body_reader = stream;
-    body_reader
-        .read_exact(&mut body)
-        .map_err(|e| Error::Io(e))?;
+    body_reader.read_exact(&mut body).map_err(Error::Io)?;
 
     let response = decode_response(&body)?;
     let mut received_fd = None;
@@ -263,7 +261,7 @@ pub fn recv_response_with_fd(stream: &UnixStream) -> Result<(Response, Option<Ow
                 .map(|fd| fd.try_clone())
                 .next()
                 .transpose()
-                .map_err(|e| Error::Io(e.into()))?;
+                .map_err(|e| Error::Io(e))?;
         }
     }
 
@@ -274,10 +272,7 @@ pub fn recv_response_with_fd(stream: &UnixStream) -> Result<(Response, Option<Ow
 pub async fn read_frame_async(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut len = [0u8; 4];
-    reader
-        .read_exact(&mut len)
-        .await
-        .map_err(|e| Error::Io(e))?;
+    reader.read_exact(&mut len).await.map_err(Error::Io)?;
     let len = u32::from_le_bytes(len) as usize;
     if len > FRAME_MAX_BYTES {
         return Err(Error::Proto(format!(
@@ -285,10 +280,7 @@ pub async fn read_frame_async(reader: &mut (impl tokio::io::AsyncRead + Unpin)) 
         )));
     }
     let mut frame = vec![0u8; len];
-    reader
-        .read_exact(&mut frame)
-        .await
-        .map_err(|e| Error::Io(e))?;
+    reader.read_exact(&mut frame).await.map_err(Error::Io)?;
     Ok(frame)
 }
 
@@ -306,9 +298,9 @@ pub async fn write_frame_async(
     writer
         .write_all(&(frame.len() as u32).to_le_bytes())
         .await
-        .map_err(|e| Error::Io(e))?;
-    writer.write_all(frame).await.map_err(|e| Error::Io(e))?;
-    writer.flush().await.map_err(|e| Error::Io(e))?;
+        .map_err(Error::Io)?;
+    writer.write_all(frame).await.map_err(Error::Io)?;
+    writer.flush().await.map_err(Error::Io)?;
     Ok(())
 }
 
@@ -428,7 +420,7 @@ impl SharedAudioRing {
                     .map(|fd| fd.try_clone())
                     .next()
                     .transpose()
-                    .map_err(|e| Error::Io(e.into()))?
+                    .map_err(|e| Error::Io(e))?
                     .ok_or_else(|| Error::Ring("no file descriptor received".to_string()));
             }
         }
@@ -892,7 +884,7 @@ fn decode_speech_event(bytes: &[u8]) -> Result<Response> {
 }
 
 fn field_varint(out: &mut Vec<u8>, field: u32, value: u64) {
-    varint(out, ((field as u64) << 3) | 0);
+    varint(out, ((field as u64) << 3));
     varint(out, value);
 }
 

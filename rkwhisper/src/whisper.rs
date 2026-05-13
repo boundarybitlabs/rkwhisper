@@ -362,7 +362,7 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
             let Some(last_ts) = new_last_ts else { break };
 
             // No advancement: model is stuck at or before the previous seek point.
-            if prev_last_ts.map_or(false, |p| last_ts <= p) {
+            if prev_last_ts.is_some_and(|p| last_ts <= p) {
                 break;
             }
 
@@ -491,18 +491,18 @@ fn vad_audio_windows(vad_segments: &[VadSegment]) -> Vec<AudioWindow> {
                 start = end;
             }
         } else {
-            let wall_clock_overflow = group_start.map_or(false, |s| seg.end_sample - s > N_SAMPLES);
+            let wall_clock_overflow = group_start.is_some_and(|s| seg.end_sample - s > N_SAMPLES);
             let speech_overflow = group_speech + seg_len > N_SAMPLES;
 
-            if wall_clock_overflow || speech_overflow {
-                if let Some(start) = group_start.take() {
-                    windows.push(AudioWindow {
-                        index: windows.len(),
-                        start_sample: start,
-                        end_sample: group_end,
-                    });
-                    group_speech = 0;
-                }
+            if (wall_clock_overflow || speech_overflow)
+                && let Some(start) = group_start.take()
+            {
+                windows.push(AudioWindow {
+                    index: windows.len(),
+                    start_sample: start,
+                    end_sample: group_end,
+                });
+                group_speech = 0;
             }
 
             if group_start.is_none() {
