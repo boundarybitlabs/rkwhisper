@@ -239,7 +239,9 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
     decoder.set_enc_kv(enc_k, enc_v);
 
     let tok_eot = S::TOKEN_EOT;
-    let tok_notimestamps = tokenizer.token_to_id("<|notimestamps|>").unwrap();
+    let tok_notimestamps = tokenizer
+        .token_to_id("<|notimestamps|>")
+        .ok_or_else(|| anyhow!("tokenizer missing <|notimestamps|>"))?;
     let timestamp_begin = tok_notimestamps + 1;
     let window_duration_sec = samples_to_sec(window_end_sample - window_start_sample);
 
@@ -433,11 +435,19 @@ fn control_prompt(
     task: &str, // "transcribe" or "translate"
     notimestamps: bool,
 ) -> Result<Vec<u32>> {
-    let start = tok.token_to_id("<|startoftranscript|>").unwrap();
-    let lang = tok.token_to_id(&format!("<|{lang}|>")).unwrap();
-    let task = tok.token_to_id(&format!("<|{task}|>")).unwrap();
-    let nots = tok.token_to_id("<|notimestamps|>").unwrap();
-    let mut prompt = vec![start, lang, task];
+    let start = tok
+        .token_to_id("<|startoftranscript|>")
+        .ok_or_else(|| anyhow!("tokenizer missing <|startoftranscript|>"))?;
+    let lang_tok = tok
+        .token_to_id(&format!("<|{lang}|>"))
+        .ok_or_else(|| anyhow!("tokenizer missing language token <|{lang}|>"))?;
+    let task_tok = tok
+        .token_to_id(&format!("<|{task}|>"))
+        .ok_or_else(|| anyhow!("tokenizer missing task token <|{task}|>"))?;
+    let nots = tok
+        .token_to_id("<|notimestamps|>")
+        .ok_or_else(|| anyhow!("tokenizer missing <|notimestamps|>"))?;
+    let mut prompt = vec![start, lang_tok, task_tok];
     if notimestamps {
         prompt.push(nots);
     }
