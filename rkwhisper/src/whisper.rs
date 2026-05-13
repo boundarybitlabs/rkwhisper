@@ -296,12 +296,13 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
             let pass_suppress =
                 |tokens: &[u32], logits: &mut [f32]| pass_suppressor.apply(tokens, logits);
 
+            let prompt_len = prompt.len();
             let new_tokens = if options.beam_size > 1 {
                 let mut beam_search = BeamSearch::<S>::new(
                     options.beam_size,
                     state.clone(),
                     last_logits,
-                    prompt.clone(),
+                    prompt,
                     1.0,
                 );
                 for _ in 0..options.max_new_tokens {
@@ -311,11 +312,11 @@ pub(crate) fn transcribe_window_samples<S: WhisperSpec>(
                     }
                 }
                 let full = beam_search.best_result().unwrap_or_default();
-                full.get(prompt.len()..).unwrap_or(&[]).to_vec()
+                full.get(prompt_len..).unwrap_or(&[]).to_vec()
             } else {
                 let mut generated = Vec::new();
                 let mut current_logits = last_logits;
-                let mut tokens_with_prompt = prompt.clone();
+                let mut tokens_with_prompt = prompt;
 
                 for _step in 0..options.max_new_tokens {
                     let mut logits_1d = current_logits.clone();

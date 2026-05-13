@@ -99,22 +99,18 @@ impl<S: WhisperSpec> EncKvModel<S> {
         let mut enc_v: Vec<Vec<f16>> = vec![vec![zero; per_layer_len]; l];
 
         let mut outputs: Vec<Output<'_>> = Vec::with_capacity(2 * l);
-        // We use zip and iter_mut to give the borrow checker proof of disjointness.
-        let mut k_iter = enc_k.iter_mut();
-        let mut v_iter = enc_v.iter_mut();
-
-        for i in 0..l {
+        for (i, (k_buf, v_buf)) in enc_k.iter_mut().zip(enc_v.iter_mut()).enumerate() {
             outputs.push(Output {
                 index: (2 * i) as u32,
                 kind: OutputKind::Preallocated {
-                    buf: BufMutView::F16(k_iter.next().unwrap()),
+                    buf: BufMutView::F16(k_buf),
                     want_float: false,
                 },
             });
             outputs.push(Output {
                 index: (2 * i + 1) as u32,
                 kind: OutputKind::Preallocated {
-                    buf: BufMutView::F16(v_iter.next().unwrap()),
+                    buf: BufMutView::F16(v_buf),
                     want_float: false,
                 },
             });
