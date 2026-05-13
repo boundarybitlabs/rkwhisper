@@ -70,8 +70,6 @@ pub struct PyClientHello {
     #[pyo3(get, set)]
     pub model: String,
     #[pyo3(get, set)]
-    pub mode: String,
-    #[pyo3(get, set)]
     pub lang: String,
     #[pyo3(get, set)]
     pub task: String,
@@ -94,10 +92,9 @@ pub struct PyClientHello {
 #[pymethods]
 impl PyClientHello {
     #[new]
-    #[pyo3(signature = (model, mode="batch".to_string(), lang="en".to_string(), task="transcribe".to_string(), max_new_tokens=128, beam_size=5, notimestamps=false, suppress_tokens="default".to_string(), audio_format=None, vad=None, client_id="".to_string()))]
+    #[pyo3(signature = (model, lang="en".to_string(), task="transcribe".to_string(), max_new_tokens=128, beam_size=5, notimestamps=false, suppress_tokens="default".to_string(), audio_format=None, vad=None, client_id="".to_string()))]
     fn new(
         model: String,
-        mode: String,
         lang: String,
         task: String,
         max_new_tokens: usize,
@@ -110,7 +107,6 @@ impl PyClientHello {
     ) -> Self {
         Self {
             model,
-            mode,
             lang,
             task,
             max_new_tokens,
@@ -265,7 +261,6 @@ impl SyncSession {
     fn connect(socket_path: String, hello: &PyClientHello) -> PyResult<Self> {
         let hello_internal = ClientHello {
             model: hello.model.clone(),
-            mode: hello.mode.clone(),
             lang: hello.lang.clone(),
             task: hello.task.clone(),
             max_new_tokens: hello.max_new_tokens,
@@ -582,7 +577,6 @@ impl AsyncSession {
     ) -> PyResult<Bound<'py, PyAny>> {
         let hello_internal = ClientHello {
             model: hello.model.clone(),
-            mode: hello.mode.clone(),
             lang: hello.lang.clone(),
             task: hello.task.clone(),
             max_new_tokens: hello.max_new_tokens,

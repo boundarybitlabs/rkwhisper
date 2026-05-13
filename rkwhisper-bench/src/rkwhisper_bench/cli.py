@@ -301,7 +301,6 @@ def main() -> None:
 
     hello = ClientHello(
         model=args.model,
-        mode="batch",
         lang=args.lang,
         max_new_tokens=_MAX_NEW_TOKENS,
         beam_size=args.beam_size,

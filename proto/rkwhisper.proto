@@ -22,8 +22,9 @@ message VadOptions {
 }
 
 message ClientHello {
+  reserved 2;
+
   string model = 1;
-  string mode = 2;
   string lang = 3;
   string task = 4;
   uint32 max_new_tokens = 5;

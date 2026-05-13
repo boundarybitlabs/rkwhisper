@@ -69,16 +69,24 @@ impl VadModel {
     }
 
     pub fn speech_probability(&self, window: &[f32], state: &mut [f32]) -> Result<f32> {
+        self.speech_probability_with_window_samples(window, state, self.config.window_samples)
+    }
+
+    pub fn speech_probability_with_window_samples(
+        &self,
+        window: &[f32],
+        state: &mut [f32],
+        window_samples: usize,
+    ) -> Result<f32> {
         let mut padded_window;
-        let window_to_use = if window.len() != self.config.window_samples {
-            padded_window = vec![0.0f32; self.config.window_samples];
-            let len = window.len().min(self.config.window_samples);
+        let window_to_use = if window.len() != window_samples {
+            padded_window = vec![0.0f32; window_samples];
+            let len = window.len().min(window_samples);
             padded_window[..len].copy_from_slice(&window[..len]);
             &padded_window
         } else {
             window
         };
-
         self.rknn.set_inputs(vec![
             Input {
                 index: 0,

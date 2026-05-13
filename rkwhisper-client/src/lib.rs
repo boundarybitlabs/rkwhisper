@@ -199,7 +199,7 @@ pub mod sync {
 
         /// Send all samples, finish the stream, and collect transcript segments.
         ///
-        /// This convenience method is intended for batch transcription. For
+        /// This convenience method is intended for one-shot transcription. For
         /// live audio or long-running streams, use [`split`](Self::split).
         pub fn transcribe_all(&mut self, samples: &[f32]) -> Result<Transcription> {
             let pcm = samples_to_pcm(samples);
@@ -456,7 +456,7 @@ pub mod asynchronous {
 
         /// Send all samples, finish the stream, and collect transcript segments.
         ///
-        /// This convenience method is intended for batch transcription. For
+        /// This convenience method is intended for one-shot transcription. For
         /// live audio or long-running streams, use [`split`](Self::split).
         pub async fn transcribe_all(&mut self, samples: &[f32]) -> Result<Transcription> {
             let pcm = samples_to_pcm(samples);

@@ -11,14 +11,21 @@ import sys
 import wave
 import threading
 from pathlib import Path
-from rkwhisper_client import SyncSession, ClientHello, VadOptions, Segment, Done, SpeechStarted, SpeechEnded
+from rkwhisper_client import (
+    ClientHello,
+    Done,
+    Segment,
+    SpeechEnded,
+    SpeechStarted,
+    SyncSession,
+    VadOptions,
+)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Client for rkwhisperd")
     parser.add_argument("wav", type=Path, help="mono 16 kHz WAV file")
     parser.add_argument("--socket", default="/run/rkwhisper/asr.sock", help="rkwhisperd Unix socket")
-    parser.add_argument("--mode", choices=("batch", "stream"), default="batch")
     parser.add_argument("--model", default="whisper-tiny-30s")
     parser.add_argument("--lang", default="en")
     parser.add_argument("--task", default="transcribe")
@@ -34,8 +41,8 @@ def main() -> int:
     parser.add_argument(
         "--frame-ms",
         type=int,
-        default=1000,
-        help="stream mode PCM chunk duration in milliseconds",
+        default=0,
+        help="PCM chunk duration in milliseconds; 0 sends the WAV as one chunk",
     )
     parser.add_argument(
         "--text",
@@ -46,7 +53,6 @@ def main() -> int:
 
     hello = ClientHello(
         model=args.model,
-        mode=args.mode,
         lang=args.lang,
         task=args.task,
         max_new_tokens=args.max_new_tokens,
@@ -66,24 +72,24 @@ def main() -> int:
     try:
         with SyncSession.connect(args.socket, hello) as session:
             pcm_data = read_wav_s16le(args.wav)
-            
-            if args.mode == "batch":
-                session.send_audio(pcm_data)
-                session.finish()
+            sender, receiver = session.split()
+            transcript_parts = []
 
-                # 2. Consume results
-                transcript_parts = []
-                for resp in session:
+            def receiver_thread():
+                for resp in receiver:
                     if isinstance(resp, Segment):
                         if args.text:
                             transcript_parts.append(resp.text)
                         else:
-                            print({
-                                "type": "segment",
-                                "text": resp.text,
-                                "begin": resp.begin,
-                                "end": resp.end
-                            }, flush=True)
+                            print(
+                                {
+                                    "type": "segment",
+                                    "text": resp.text,
+                                    "begin": resp.begin,
+                                    "end": resp.end,
+                                },
+                                flush=True,
+                            )
                     elif isinstance(resp, SpeechStarted):
                         if not args.text:
                             print({"type": "speech_started", "begin": resp.begin}, flush=True)
@@ -92,61 +98,31 @@ def main() -> int:
                             print({"type": "speech_ended", "end": resp.end}, flush=True)
                     elif isinstance(resp, Done):
                         if not args.text:
-                            print({
-                                "type": "done",
-                                "audio_s": resp.audio_s,
-                                "rtf": resp.rtf
-                            }, flush=True)
-
-                if args.text and transcript_parts:
-                    print(" ".join(transcript_parts).strip())
-            else:
-                # In stream mode, split and use a background thread for responses
-                sender, receiver = session.split()
-                transcript_parts = []
-
-                def receiver_thread():
-                    for resp in receiver:
-                        if isinstance(resp, Segment):
-                            if args.text:
-                                transcript_parts.append(resp.text)
-                            else:
-                                print({
-                                    "type": "segment",
-                                    "text": resp.text,
-                                    "begin": resp.begin,
-                                    "end": resp.end
-                                }, flush=True)
-                        elif isinstance(resp, SpeechStarted):
-                            if not args.text:
-                                print({"type": "speech_started", "begin": resp.begin}, flush=True)
-                        elif isinstance(resp, SpeechEnded):
-                            if not args.text:
-                                print({"type": "speech_ended", "end": resp.end}, flush=True)
-                        elif isinstance(resp, Done):
-                            if not args.text:
-                                print({
+                            print(
+                                {
                                     "type": "done",
                                     "audio_s": resp.audio_s,
-                                    "rtf": resp.rtf
-                                }, flush=True)
+                                    "rtf": resp.rtf,
+                                },
+                                flush=True,
+                            )
 
-                t = threading.Thread(target=receiver_thread, daemon=True)
-                t.start()
+            t = threading.Thread(target=receiver_thread, daemon=True)
+            t.start()
 
-                # In stream mode, send in chunks
+            if args.frame_ms <= 0:
+                sender.send_audio(pcm_data)
+            else:
                 chunk_size = (16000 * 2 * args.frame_ms) // 1000
                 for i in range(0, len(pcm_data), chunk_size):
-                    sender.send_audio(pcm_data[i:i+chunk_size])
-                
-                sender.finish()
-                
-                # Wait for receiver thread to finish
-                t.join()
+                    sender.send_audio(pcm_data[i : i + chunk_size])
 
-                if args.text and transcript_parts:
-                    print(" ".join(transcript_parts).strip())
-                
+            sender.finish()
+            t.join()
+
+            if args.text and transcript_parts:
+                print(" ".join(transcript_parts).strip())
+
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

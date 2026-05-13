@@ -93,11 +93,18 @@ impl TokenSuppressor {
             }
         }
 
-        // Prevent consecutive timestamps
-        if let Some(&last) = tokens.last() {
-            if last >= self.timestamp_begin {
-                for i in (self.timestamp_begin as usize)..logits.len() {
-                    logits[i] = -1e4;
+        // Prevent consecutive timestamps in the *generated* sequence only.
+        // The check intentionally ignores prompt tokens: when a seek pass ends
+        // with [ts@seek] in the prompt, the model must be free to echo that
+        // timestamp as its first generated token.  Checking tokens.last()
+        // (which includes the prompt) was incorrectly blocking that echo and
+        // forcing the model to start with text, sometimes from before the seek.
+        if let Some(generated) = tokens.get(self.prompt_len..) {
+            if let Some(&last) = generated.last() {
+                if last >= self.timestamp_begin {
+                    for i in (self.timestamp_begin as usize)..logits.len() {
+                        logits[i] = -1e4;
+                    }
                 }
             }
         }

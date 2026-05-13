@@ -1,7 +1,6 @@
 import pytest
 import wave
 import os
-import asyncio
 from pathlib import Path
 from rkwhisper_client import ClientHello, Segment, SpeechStarted, SpeechEnded
 
@@ -12,9 +11,7 @@ WAV_PATH = next(FIXTURES_DIR.glob("*.wav"), None)
 @pytest.mark.asyncio
 async def test_async_transcribe_audio(async_session_factory):
     """End-to-end async transcription test."""
-    hello = ClientHello(
-        model=TEST_MODEL, client_id="pytest-async-stream", mode="stream"
-    )
+    hello = ClientHello(model=TEST_MODEL, client_id="pytest-async-stream")
     session = await async_session_factory(hello)
     sender, receiver = session.split()
     
@@ -62,11 +59,6 @@ async def test_async_connect_invalid_model(async_session_factory):
     
     hello = ClientHello(model="whisper-invalid-async")
     socket_path = os.getenv("RKWHISPER_SOCKET", "/run/rkwhisper/asr.sock")
-    
-    with pytest.raises(RuntimeError) as excinfo:
-        await AsyncSession.connect(socket_path, hello)
-    assert "model not found" in str(excinfo.value).lower()
-t_path = os.getenv("RKWHISPER_SOCKET", "/run/rkwhisper/asr.sock")
     
     with pytest.raises(RuntimeError) as excinfo:
         await AsyncSession.connect(socket_path, hello)
