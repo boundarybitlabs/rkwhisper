@@ -75,12 +75,8 @@ jobs:
             debhelper \
             fakeroot \
             dh-python \
-            pybuild-plugin-pyproject \
             python3-all-dev \
-            python3-build
-
-      - name: Install maturin
-        run: sudo apt-get install -y python3-maturin
+            python3-maturin
 
       - name: Install additional Python versions via deadsnakes
         run: |

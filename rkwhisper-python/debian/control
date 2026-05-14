@@ -5,10 +5,8 @@ Maintainer: Boyd Johnson <boyd@boundarybit.io>
 Build-Depends:
  debhelper-compat (= 13),
  dh-python,
- pybuild-plugin-pyproject,
  python3-all-dev,
- python3-build,
- maturin (>= 1.0),
+ python3-maturin (>= 1.0),
  cargo,
  rustc
 Standards-Version: 4.7.0

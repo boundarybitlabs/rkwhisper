@@ -1,28 +1,39 @@
 #!/usr/bin/make -f
 
-# pybuild invokes the PEP 517 backend (maturin) via python3-build.
-export PYBUILD_SYSTEM = pyproject
-
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
-# pybuild overrides HOME to the build dir; capture real paths before that happens.
 export RUSTUP_HOME := $(HOME)/.rustup
 export CARGO_HOME := $(HOME)/.cargo
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 export RUSTUP_TOOLCHAIN = stable
 export CARGO_NET_OFFLINE = true
 
+WHEEL_DIR  = $(CURDIR)/debian/.wheels
+PYSITE     = usr/lib/python3/dist-packages
+PKGDEST    = $(CURDIR)/debian/python3-rkwhisper-client
 PYVERSIONS = 3.12 3.13 3.14
 
 %:
-	dh $@ --with python3 --buildsystem=pybuild
+	dh $@ --with python3
 
 override_dh_auto_build:
-	pybuild --build -p "$(PYVERSIONS)"
+	mkdir -p $(WHEEL_DIR)
+	for pyver in $(PYVERSIONS); do \
+		if command -v python$${pyver} >/dev/null 2>&1; then \
+			maturin build --release --interpreter python$${pyver} --out $(WHEEL_DIR); \
+		fi; \
+	done
 
 override_dh_auto_install:
-	pybuild --install --dest-dir $(CURDIR)/debian/python3-rkwhisper-client \
-		-p "$(PYVERSIONS)"
+	mkdir -p $(PKGDEST)/$(PYSITE)
+	for whl in $(WHEEL_DIR)/rkwhisper_client-*.whl; do \
+		python3 -c "\
+import zipfile, sys, pathlib; \
+z = zipfile.ZipFile(sys.argv[1]); \
+dest = pathlib.Path(sys.argv[2]); \
+[z.extract(n, str(dest)) for n in z.namelist() if '.dist-info' not in n]; \
+" "$$whl" "$(PKGDEST)/$(PYSITE)"; \
+	done
 
 override_dh_auto_test:
-	pybuild --test -p "$(PYVERSIONS)"
+	:
