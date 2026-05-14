@@ -7,22 +7,64 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import jiwer
+import re
+import string
+from dataclasses import dataclass as _dataclass
+
 import numpy as np
 import soundfile as sf
 from rkwhisper_client import ClientHello, Done, Segment, SyncSession, VadOptions
 
 from .librispeech import load_utterances
 
-TRANSFORM = jiwer.Compose(
-    [
-        jiwer.ToLowerCase(),
-        jiwer.RemovePunctuation(),
-        jiwer.RemoveMultipleSpaces(),
-        jiwer.Strip(),
-        jiwer.ReduceToListOfListOfWords(),
-    ]
-)
+_PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+
+
+def _normalize(text: str) -> list[str]:
+    return re.sub(r"\s+", " ", text.lower().translate(_PUNCT_TABLE)).split()
+
+
+@_dataclass
+class _WerResult:
+    hits: int
+    substitutions: int
+    deletions: int
+    insertions: int
+
+
+def _process_words(reference: str, hypothesis: str) -> _WerResult:
+    ref = _normalize(reference)
+    hyp = _normalize(hypothesis)
+    r, h = len(ref), len(hyp)
+    mat = [[0] * (h + 1) for _ in range(r + 1)]
+    for j in range(h + 1):
+        mat[0][j] = j
+    for i in range(r + 1):
+        mat[i][0] = i
+    for i in range(1, r + 1):
+        for j in range(1, h + 1):
+            if ref[i - 1] == hyp[j - 1]:
+                mat[i][j] = mat[i - 1][j - 1]
+            else:
+                mat[i][j] = 1 + min(mat[i - 1][j - 1], mat[i - 1][j], mat[i][j - 1])
+    hits = subs = dels = ins = 0
+    i, j = r, h
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and ref[i - 1] == hyp[j - 1]:
+            hits += 1
+            i -= 1
+            j -= 1
+        elif i > 0 and j > 0 and mat[i][j] == mat[i - 1][j - 1] + 1:
+            subs += 1
+            i -= 1
+            j -= 1
+        elif i > 0 and mat[i][j] == mat[i - 1][j] + 1:
+            dels += 1
+            i -= 1
+        else:
+            ins += 1
+            j -= 1
+    return _WerResult(hits=hits, substitutions=subs, deletions=dels, insertions=ins)
 
 _MAX_NEW_TOKENS = 448
 
@@ -185,12 +227,7 @@ def bench_split(
             stats.errors += 1
             continue
 
-        result = jiwer.process_words(
-            utt.reference,
-            hyp,
-            reference_transform=TRANSFORM,
-            hypothesis_transform=TRANSFORM,
-        )
+        result = _process_words(utt.reference, hyp)
 
         ref_words = result.hits + result.substitutions + result.deletions
         utt_wer = (
@@ -212,8 +249,8 @@ def bench_split(
             f" | WER: {utt_wer:5.1%} | RTF: {server_rtf:.3f} | {duration:.1f}s"
         )
         if verbose:
-            ref_norm = " ".join(TRANSFORM([utt.reference])[0])
-            hyp_norm = " ".join(TRANSFORM([hyp])[0]) if hyp.strip() else "(empty)"
+            ref_norm = " ".join(_normalize(utt.reference))
+            hyp_norm = " ".join(_normalize(hyp)) if hyp.strip() else "(empty)"
             print(f"    REF: {ref_norm}")
             print(f"    HYP: {hyp_norm}")
 

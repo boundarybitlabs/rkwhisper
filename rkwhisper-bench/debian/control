@@ -18,7 +18,6 @@ Depends:
  ${python3:Depends},
  python3-numpy,
  python3-soundfile,
- python3-jiwer,
  python3-rkwhisper-client
 Description: LibriSpeech WER and RTF benchmark for rkwhisperd
  Command-line tool that runs rkwhisperd against LibriSpeech test-clean and
