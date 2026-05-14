@@ -5,7 +5,7 @@ use rkwhisper_protocol::{ClientHello, SAMPLE_RATE};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-#[pyclass(name = "AudioFormat")]
+#[pyclass(name = "AudioFormat", from_py_object)]
 #[derive(Clone)]
 pub struct PyAudioFormat {
     #[pyo3(get, set)]
@@ -29,7 +29,7 @@ impl PyAudioFormat {
     }
 }
 
-#[pyclass(name = "VadOptions")]
+#[pyclass(name = "VadOptions", from_py_object)]
 #[derive(Clone)]
 pub struct PyVadOptions {
     #[pyo3(get, set)]
@@ -163,7 +163,7 @@ impl SyncAudioSender {
             .ok_or_else(|| PyRuntimeError::new_err("PCM buffer is not C-contiguous"))?;
         let bytes = unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len()) };
 
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner
                 .send_audio(bytes)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -171,7 +171,7 @@ impl SyncAudioSender {
     }
 
     fn finish(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner
                 .finish()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -179,7 +179,7 @@ impl SyncAudioSender {
     }
 
     fn cancel(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| {
+        py.detach(|| {
             self.inner
                 .cancel()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -195,8 +195,8 @@ pub struct SyncResponseReceiver {
 
 #[pymethods]
 impl SyncResponseReceiver {
-    fn recv_response(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
-        let response = py.allow_threads(|| {
+    fn recv_response(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let response = py.detach(|| {
             self.inner
                 .recv_response()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -232,7 +232,7 @@ impl SyncResponseReceiver {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         if self.done_received {
             return Ok(None);
         }
@@ -318,7 +318,7 @@ impl SyncSession {
             .ok_or_else(|| PyRuntimeError::new_err("PCM buffer is not C-contiguous"))?;
         let bytes = unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len()) };
 
-        py.allow_threads(|| {
+        py.detach(|| {
             inner
                 .send_audio(bytes)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -330,7 +330,7 @@ impl SyncSession {
             .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("session split or closed"))?;
-        py.allow_threads(|| {
+        py.detach(|| {
             inner
                 .finish()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -342,7 +342,7 @@ impl SyncSession {
             .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("session split or closed"))?;
-        py.allow_threads(|| {
+        py.detach(|| {
             inner
                 .cancel()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -355,9 +355,9 @@ impl SyncSession {
 
     fn __exit__(
         &mut self,
-        _exc_type: PyObject,
-        _exc_value: PyObject,
-        _traceback: PyObject,
+        _exc_type: Py<PyAny>,
+        _exc_value: Py<PyAny>,
+        _traceback: Py<PyAny>,
     ) -> PyResult<()> {
         Ok(())
     }
@@ -366,7 +366,7 @@ impl SyncSession {
         slf
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         if self.done_received {
             return Ok(None);
         }
@@ -382,12 +382,12 @@ impl SyncSession {
         }
     }
 
-    fn recv_response(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    fn recv_response(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let inner = self
             .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("session split or closed"))?;
-        let response = py.allow_threads(|| {
+        let response = py.detach(|| {
             inner
                 .recv_response()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -490,7 +490,7 @@ impl AsyncResponseReceiver {
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            Python::with_gil(|py| match response {
+            Python::attach(|py| match response {
                 rkwhisper_protocol::Response::Segment { text, begin, end } => {
                     Ok(PySegment { text, begin, end }.into_py_any(py)?)
                 }
@@ -532,7 +532,7 @@ impl AsyncResponseReceiver {
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            Python::with_gil(|py| match response {
+            Python::attach(|py| match response {
                 rkwhisper_protocol::Response::Done { .. } => {
                     Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
                 }
@@ -632,9 +632,9 @@ impl AsyncSession {
     fn __aexit__<'py>(
         &self,
         py: Python<'py>,
-        _exc_type: PyObject,
-        _exc_value: PyObject,
-        _traceback: PyObject,
+        _exc_type: Py<PyAny>,
+        _exc_value: Py<PyAny>,
+        _traceback: Py<PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(()) })
     }

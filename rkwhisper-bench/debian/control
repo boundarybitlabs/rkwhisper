@@ -1,0 +1,25 @@
+Source: rkwhisper-bench
+Section: python
+Priority: optional
+Maintainer: Boyd Johnson <boyd@boundarybit.io>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-python,
+ pybuild-plugin-pyproject,
+ python3-all,
+ python3-hatchling
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: rkwhisper-bench
+Architecture: all
+Depends:
+ ${misc:Depends},
+ ${python3:Depends},
+ python3-numpy,
+ python3-soundfile,
+ python3-rkwhisper-client
+Description: LibriSpeech WER and RTF benchmark for rkwhisperd
+ Command-line tool that runs rkwhisperd against LibriSpeech test-clean and
+ test-other splits, reporting word error rate (WER) and real-time factor
+ (RTF) per utterance and as a corpus-level summary.

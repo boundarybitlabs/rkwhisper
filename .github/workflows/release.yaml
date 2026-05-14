@@ -1,39 +1,16 @@
-name: CI
+name: Release
 
 on:
   push:
-    branches:
-      - main
-  pull_request:
+    tags:
+      - 'v*'
 
 jobs:
-  rust:
-    name: Rust
-    runs-on: ubuntu-24.04-arm
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --component rustfmt
-
-      - name: Cargo check
-        run: cargo check --all-targets
-
-      - name: Cargo fmt
-        run: cargo fmt --all -- --check
-
-      - name: Cargo test
-        run: cargo test --all-targets
-
-  deb-rkwhisperd:
+  rkwhisperd-deb:
     name: rkwhisperd .deb
     runs-on: ubuntu-24.04-arm
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         run: |
@@ -49,13 +26,12 @@ jobs:
       - name: Build .deb
         run: cargo deb -p rkwhisper --no-build --target aarch64-unknown-linux-gnu
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: rkwhisperd-deb
           path: target/aarch64-unknown-linux-gnu/debian/rkwhisperd_*.deb
 
-  deb-python-client:
+  python-client-deb:
     name: python3-rkwhisper-client .deb (${{ matrix.ubuntu }})
     runs-on: ubuntu-24.04-arm
     container:
@@ -76,8 +52,7 @@ jobs:
             python3-maturin \
             cargo rustc
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         run: |
@@ -92,19 +67,16 @@ jobs:
         working-directory: rkwhisper-python
         run: . $HOME/.cargo/env && dpkg-buildpackage -us -uc -b -rfakeroot -d
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: python-client-deb-ubuntu-${{ matrix.ubuntu }}
           path: python3-rkwhisper-client_*.deb
 
-  deb-bench:
+  bench-deb:
     name: rkwhisper-bench .deb
     runs-on: ubuntu-24.04-arm
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install Debian build dependencies
         run: |
@@ -121,8 +93,29 @@ jobs:
         working-directory: rkwhisper-bench
         run: dpkg-buildpackage -us -uc -b -rfakeroot -d
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: bench-deb
+          # dpkg-buildpackage places output in the parent of the source tree
           path: rkwhisper-bench_*.deb
+
+  release:
+    name: GitHub Release
+    needs: [rkwhisperd-deb, python-client-deb, bench-deb]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - name: Download all debs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-deb'
+          path: dist/
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          generate_release_notes: true
+          fail_on_unmatched_files: true

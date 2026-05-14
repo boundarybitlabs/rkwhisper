@@ -1,0 +1,34 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+export RUSTUP_HOME := $(HOME)/.rustup
+export CARGO_HOME := $(HOME)/.cargo
+export PATH := $(HOME)/.cargo/bin:$(PATH)
+export RUSTUP_TOOLCHAIN = stable
+export CARGO_NET_OFFLINE = true
+
+WHEEL_DIR = $(CURDIR)/debian/.wheels
+PYSITE    = usr/lib/python3/dist-packages
+PKGDEST   = $(CURDIR)/debian/python3-rkwhisper-client
+
+%:
+	dh $@ --with python3
+
+override_dh_auto_build:
+	mkdir -p $(WHEEL_DIR)
+	maturin build --release --interpreter python3 --out $(WHEEL_DIR)
+
+override_dh_auto_install:
+	mkdir -p $(PKGDEST)/$(PYSITE)
+	for whl in $(WHEEL_DIR)/rkwhisper_client-*.whl; do \
+		python3 -c "\
+import zipfile, sys, pathlib; \
+z = zipfile.ZipFile(sys.argv[1]); \
+dest = pathlib.Path(sys.argv[2]); \
+[z.extract(n, str(dest)) for n in z.namelist() if '.dist-info' not in n]; \
+" "$$whl" "$(PKGDEST)/$(PYSITE)"; \
+	done
+
+override_dh_auto_test:
+	:
