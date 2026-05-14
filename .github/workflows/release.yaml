@@ -32,56 +32,44 @@ jobs:
           path: target/aarch64-unknown-linux-gnu/debian/rkwhisperd_*.deb
 
   python-client-deb:
-    name: python3-rkwhisper-client .deb
+    name: python3-rkwhisper-client .deb (${{ matrix.ubuntu }})
     runs-on: ubuntu-24.04-arm
+    container:
+      image: ubuntu:${{ matrix.ubuntu }}
+    strategy:
+      matrix:
+        ubuntu: ["24.04", "25.04", "26.04"]
+
     steps:
+      - name: Install system packages
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git curl ca-certificates \
+            debhelper fakeroot \
+            dh-python \
+            python3-all-dev \
+            python3-maturin \
+            cargo rustc
+
       - uses: actions/checkout@v4
 
-      # Rustup-managed Rust is used for compilation. We pass -d to
-      # dpkg-buildpackage to skip the Build-Depends check for rustc/cargo
-      # since they are not registered as Debian packages here.
-      - name: Install Rust
+      - name: Install Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          . $HOME/.cargo/env
           rustup default stable
 
-      - name: Install Debian build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            debhelper \
-            fakeroot \
-            dh-python \
-            pybuild-plugin-pyproject \
-            python3-all-dev \
-            python3-build
-
-      - name: Install maturin
-        run: sudo apt-get install -y python3-maturin
-
-      # Install additional Python versions so pybuild compiles a .so for each:
-      #   3.12 → Ubuntu 24.04 (already present via python3-all-dev)
-      #   3.13 → Ubuntu 25.04
-      #   3.14 → Ubuntu 26.04
-      - name: Install additional Python versions via deadsnakes
-        run: |
-          sudo add-apt-repository -y ppa:deadsnakes/ppa
-          sudo apt-get update
-          sudo apt-get install -y \
-            python3.13-dev \
-            python3.14-dev
-
       - name: Fetch cargo dependencies
-        run: cargo fetch --manifest-path rkwhisper-python/Cargo.toml
+        run: . $HOME/.cargo/env && cargo fetch --manifest-path rkwhisper-python/Cargo.toml
 
       - name: Build .deb
         working-directory: rkwhisper-python
-        run: dpkg-buildpackage -us -uc -b -rfakeroot -d
+        run: . $HOME/.cargo/env && dpkg-buildpackage -us -uc -b -rfakeroot -d
 
       - uses: actions/upload-artifact@v4
         with:
-          name: python-client-deb
-          # dpkg-buildpackage places output in the parent of the source tree
+          name: python-client-deb-ubuntu-${{ matrix.ubuntu }}
           path: python3-rkwhisper-client_*.deb
 
   bench-deb:
