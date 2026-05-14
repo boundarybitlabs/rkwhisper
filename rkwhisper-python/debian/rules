@@ -8,21 +8,16 @@ export PATH := $(HOME)/.cargo/bin:$(PATH)
 export RUSTUP_TOOLCHAIN = stable
 export CARGO_NET_OFFLINE = true
 
-WHEEL_DIR  = $(CURDIR)/debian/.wheels
-PYSITE     = usr/lib/python3/dist-packages
-PKGDEST    = $(CURDIR)/debian/python3-rkwhisper-client
-PYVERSIONS = 3.12 3.13 3.14
+WHEEL_DIR = $(CURDIR)/debian/.wheels
+PYSITE    = usr/lib/python3/dist-packages
+PKGDEST   = $(CURDIR)/debian/python3-rkwhisper-client
 
 %:
 	dh $@ --with python3
 
 override_dh_auto_build:
 	mkdir -p $(WHEEL_DIR)
-	for pyver in $(PYVERSIONS); do \
-		if command -v python$${pyver} >/dev/null 2>&1; then \
-			maturin build --release --interpreter python$${pyver} --out $(WHEEL_DIR); \
-		fi; \
-	done
+	maturin build --release --interpreter python3 --out $(WHEEL_DIR)
 
 override_dh_auto_install:
 	mkdir -p $(PKGDEST)/$(PYSITE)
